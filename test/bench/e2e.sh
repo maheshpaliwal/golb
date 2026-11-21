@@ -156,8 +156,8 @@ header() {
     echo
     echo "### $1"
     echo
-    echo "| scenario | req/s (median) | req/s (min - max) | errors | non-2xx | p50 | p90 | p99 | p99.9 | max | golb CPU (cores) | golb peak RSS (MiB) |"
-    echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+    echo "| scenario | offered req/s | ok req/s (median) | ok req/s (min - max) | errors | non-2xx | p50 | p90 | p99 | p99.9 | max | golb CPU (cores) | golb peak RSS (MiB) |"
+    echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
   } >>"$RESULTS"
 }
 
@@ -196,6 +196,7 @@ for body in $BODIES; do
     through_golb "golb-b$body-c$conns" "$conns" >>"$RESULTS"
   done
 
+  echo "- load average after closed loop, $body bytes: $(uptime | sed 's/.*load averages*: //')" >>"$RESULTS"
   rate=$(median_rps "$OUT/raw/golb-b$body-c$FIXED_RATE_CONNS.json" | awk '{ printf "%d", $1 / 2 }')
   if [ -n "$rate" ] && [ "$rate" -gt 0 ]; then
     header "Fixed rate $rate req/s (50% of golb's closed-loop median), $FIXED_RATE_CONNS connections, $body byte responses"
