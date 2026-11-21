@@ -185,7 +185,7 @@ func (r *Registry) register(name, help string, k kind, labels []string, fill fun
 		slog.Error("metric labels are not key, value pairs; last key dropped", "name", name)
 		labels = labels[:len(labels)-1]
 	}
-	key := renderLabels(labels)
+	key := seriesKey(labels)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -202,11 +202,47 @@ func (r *Registry) register(name, help string, k kind, labels []string, fill fun
 	if s != nil {
 		return s
 	}
-	s = &series{labels: key}
+	s = &series{labels: renderLabels(labels)}
 	fill(s)
 	f.index[key] = s
 	f.series = append(f.series, s)
 	return s
+}
+
+// Delete removes the series registered under name and labels, in any label
+// order. It does nothing when there is none. A handle obtained earlier keeps
+// working but is no longer exported; registering the same name and labels
+// again creates a fresh series starting at zero.
+func (r *Registry) Delete(name string, labels ...string) {
+	if len(labels)%2 != 0 {
+		labels = labels[:len(labels)-1]
+	}
+	key := seriesKey(labels)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f := r.families[name]
+	if f == nil {
+		return
+	}
+	s := f.index[key]
+	if s == nil {
+		return
+	}
+	delete(f.index, key)
+	if len(f.index) == 0 {
+		delete(r.families, name)
+		return
+	}
+	// A scrape in progress still reads the old slice outside the lock, so
+	// the survivors go into a new one instead of being shifted in place.
+	kept := make([]*series, 0, len(f.series)-1)
+	for _, other := range f.series {
+		if other != s {
+			kept = append(kept, other)
+		}
+	}
+	f.series = kept
 }
 
 // snapshot copies the family list so formatting, which calls gauge
@@ -311,6 +347,26 @@ func appendFloat(buf []byte, v float64) []byte {
 		return append(buf, "-Inf"...)
 	}
 	return strconv.AppendFloat(buf, v, 'g', -1, 64)
+}
+
+// seriesKey identifies a series independently of the order its labels were
+// given in, so {a,b} and {b,a} are one series, exported in the order of the
+// first registration.
+func seriesKey(labels []string) string {
+	if len(labels) <= 2 {
+		return renderLabels(labels)
+	}
+	type pair struct{ name, value string }
+	pairs := make([]pair, 0, len(labels)/2)
+	for i := 0; i < len(labels); i += 2 {
+		pairs = append(pairs, pair{name: labels[i], value: labels[i+1]})
+	}
+	slices.SortStableFunc(pairs, func(a, b pair) int { return strings.Compare(a.name, b.name) })
+	sorted := make([]string, 0, len(labels))
+	for _, p := range pairs {
+		sorted = append(sorted, p.name, p.value)
+	}
+	return renderLabels(sorted)
 }
 
 func renderLabels(labels []string) string {

@@ -70,23 +70,28 @@ func (h *headerFlags) Set(value string) error {
 	return nil
 }
 
-// runStats is the outcome of one measured window.
+// runStats is the outcome of one measured window. The latency figures
+// cover every request of the window, failed ones included at the time they
+// took to fail: leaving out timeouts and requests that could not be sent
+// would report the tail of the survivors only.
 type runStats struct {
-	Requests  uint64                `json:"requests"`
-	Errors    uint64                `json:"errors"` // no complete response: connect, write, read, timeout
-	Status    [statusClasses]uint64 `json:"status_classes"`
-	ReqPerSec float64               `json:"req_per_sec"`
-	P50       float64               `json:"p50_us"`
-	P90       float64               `json:"p90_us"`
-	P99       float64               `json:"p99_us"`
-	P999      float64               `json:"p999_us"`
-	Max       float64               `json:"max_us"`
-	Mean      float64               `json:"mean_us"`
-	FirstErr  string                `json:"first_error,omitempty"`
+	Requests        uint64                `json:"requests"`
+	Errors          uint64                `json:"errors"` // no complete response: connect, write, read, timeout, not sent
+	Status          [statusClasses]uint64 `json:"status_classes"`
+	ReqPerSec       float64               `json:"ok_per_sec"`        // responses with a status below 400
+	ResponsesPerSec float64               `json:"responses_per_sec"` // complete responses of any status
+	P50             float64               `json:"p50_us"`
+	P90             float64               `json:"p90_us"`
+	P99             float64               `json:"p99_us"`
+	P999            float64               `json:"p999_us"`
+	Max             float64               `json:"max_us"`
+	Mean            float64               `json:"mean_us"`
+	FirstErr        string                `json:"first_error,omitempty"`
 }
 
 // report is what one invocation prints: every run, and the run with the
-// median throughput as the representative one.
+// median successful throughput as the representative one. Rate is what was
+// offered in fixed-rate mode; what was achieved is in the runs.
 type report struct {
 	Label       string     `json:"label,omitempty"`
 	URL         string     `json:"url"`
@@ -256,8 +261,9 @@ func measure(ctx context.Context, cfg loadConfig) runStats {
 			stats.FirstErr = w.firstErr
 		}
 	}
-	stats.Requests = latency.total + stats.Errors
-	stats.ReqPerSec = float64(latency.total) / cfg.duration.Seconds()
+	stats.Requests = latency.total
+	stats.ReqPerSec = float64(stats.Status[2]+stats.Status[3]) / cfg.duration.Seconds()
+	stats.ResponsesPerSec = float64(stats.Requests-stats.Errors) / cfg.duration.Seconds()
 	stats.P50 = micros(latency.quantile(0.50))
 	stats.P90 = micros(latency.quantile(0.90))
 	stats.P99 = micros(latency.quantile(0.99))
@@ -282,7 +288,7 @@ type worker struct {
 	reader *bufio.Reader
 	timer  *time.Timer
 
-	latency  histogram // complete responses only
+	latency  histogram // every request, failed ones at the time they took to fail
 	status   [statusClasses]uint64
 	errors   uint64
 	firstErr string
@@ -310,6 +316,7 @@ func (w *worker) run(ctx context.Context) {
 		if from.Before(w.plan.recordFrom) {
 			continue
 		}
+		w.latency.record(elapsed)
 		if err != nil {
 			w.errors++
 			if w.firstErr == "" {
@@ -317,7 +324,6 @@ func (w *worker) run(ctx context.Context) {
 			}
 			continue
 		}
-		w.latency.record(elapsed)
 		class := status / classDivisor
 		if class >= statusClasses {
 			class = 0
@@ -327,10 +333,8 @@ func (w *worker) run(ctx context.Context) {
 }
 
 // pace waits for the next send and returns the instant its latency is
-// measured from. In fixed-rate mode a worker that is behind schedule
-// measures from the intended send time, so time spent queued behind a slow
-// response is counted (no coordinated omission); a worker that had to wait
-// measures from when it actually woke, so timer overshoot is not.
+// measured from. In fixed-rate mode that is always the intended send time,
+// so time a request spent queued behind a slow response counts against it.
 func (w *worker) pace(ctx context.Context, sent int) (time.Time, bool) {
 	now := time.Now()
 	if ctx.Err() != nil {
@@ -343,13 +347,10 @@ func (w *worker) pace(ctx context.Context, sent int) (time.Time, bool) {
 	if !intended.Before(w.plan.end) {
 		return now, false
 	}
-	if !now.Before(intended) {
-		return intended, true
-	}
-	if !w.sleep(ctx, intended.Sub(now)) {
+	if now.Before(intended) && !w.sleep(ctx, intended.Sub(now)) {
 		return now, false
 	}
-	return time.Now(), true
+	return intended, true
 }
 
 func (w *worker) sleep(ctx context.Context, d time.Duration) bool {
@@ -464,8 +465,8 @@ func (r *report) write(out io.Writer, cfg loadConfig) error {
 }
 
 // markdownHeader matches markdownRow; -header prints it above the row.
-const markdownHeader = `| scenario | req/s (median) | req/s (min - max) | errors | non-2xx | p50 | p90 | p99 | p99.9 | max |
-|---|---|---|---|---|---|---|---|---|---|`
+const markdownHeader = `| scenario | offered req/s | ok req/s (median) | ok req/s (min - max) | errors | non-2xx | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|---|---|---|---|`
 
 func (r *report) markdownRow() string {
 	var errs, other uint64
@@ -474,8 +475,12 @@ func (r *report) markdownRow() string {
 		other += run.nonSuccess()
 	}
 	m := r.Median
-	return fmt.Sprintf("| %s | %.0f | %.0f - %.0f | %d | %d | %s | %s | %s | %s | %s |",
-		r.Label, r.MedianRPS, r.MinRPS, r.MaxRPS, errs, other,
+	offered := "closed loop"
+	if r.Rate > 0 {
+		offered = fmt.Sprintf("%.0f", r.Rate)
+	}
+	return fmt.Sprintf("| %s | %s | %.0f | %.0f - %.0f | %d | %d | %s | %s | %s | %s | %s |",
+		r.Label, offered, r.MedianRPS, r.MinRPS, r.MaxRPS, errs, other,
 		duration(m.P50), duration(m.P90), duration(m.P99), duration(m.P999), duration(m.Max))
 }
 
@@ -497,7 +502,7 @@ func (r *report) text() string {
 		run.writeText(&b)
 	}
 	if len(r.Runs) > 1 {
-		fmt.Fprintf(&b, "\nmedian run   %.1f req/s (min %.1f, max %.1f)\n", r.MedianRPS, r.MinRPS, r.MaxRPS)
+		fmt.Fprintf(&b, "\nmedian run   %.1f ok req/s (min %.1f, max %.1f)\n", r.MedianRPS, r.MinRPS, r.MaxRPS)
 		r.Median.writeText(&b)
 	}
 	return b.String()
@@ -515,13 +520,14 @@ func (s runStats) nonSuccess() uint64 {
 
 func (s runStats) writeText(b *strings.Builder) {
 	fmt.Fprintf(b, "  requests   %d\n", s.Requests)
-	fmt.Fprintf(b, "  req/s      %.1f\n", s.ReqPerSec)
+	fmt.Fprintf(b, "  ok req/s   %.1f (status below 400)\n", s.ReqPerSec)
+	fmt.Fprintf(b, "  responses  %.1f/s (any status)\n", s.ResponsesPerSec)
 	fmt.Fprintf(b, "  errors     %d\n", s.Errors)
 	if s.FirstErr != "" {
 		fmt.Fprintf(b, "  first err  %s\n", s.FirstErr)
 	}
 	fmt.Fprintf(b, "  status     2xx=%d 3xx=%d 4xx=%d 5xx=%d other=%d\n", s.Status[2], s.Status[3], s.Status[4], s.Status[5], s.Status[0]+s.Status[1])
-	fmt.Fprintf(b, "  latency    p50=%s p90=%s p99=%s p99.9=%s max=%s mean=%s\n",
+	fmt.Fprintf(b, "  latency    (all requests, failed ones included) p50=%s p90=%s p99=%s p99.9=%s max=%s mean=%s\n",
 		duration(s.P50), duration(s.P90), duration(s.P99), duration(s.P999), duration(s.Max), duration(s.Mean))
 }
 

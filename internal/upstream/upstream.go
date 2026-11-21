@@ -5,17 +5,33 @@ package upstream
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/maheshpaliwal/golb/internal/balancer"
 	"github.com/maheshpaliwal/golb/internal/core"
 	"github.com/maheshpaliwal/golb/internal/health"
 )
 
+// failurePenalty is the least latency recorded for a failed attempt. A
+// refused connection fails in microseconds; sampled as measured, or not at
+// all, it would make a broken backend the cheapest choice for p2c_ewma.
+const failurePenalty = time.Second
+
 type pool struct {
+	name     string
 	backends []*core.Backend
 	balancer core.Balancer
 	outlier  *health.Outlier // nil when disabled
 	checker  *health.Checker // nil without a health check
+	observer core.Observer
+	// resetHealth and resetEjection say that this pool has nothing that
+	// would ever undo an unhealthy verdict or an ejection deadline carried
+	// over on a reused backend.
+	resetHealth   bool
+	resetEjection bool
+	// successor is the pool built with this one as prev.
+	successor atomic.Pointer[pool]
 
 	closeOnce sync.Once
 }
@@ -25,6 +41,9 @@ type pool struct {
 // Addr and Weight are unchanged reuses the *core.Backend from prev, so health,
 // in-flight and latency state survive a reload. obs may be nil.
 func New(spec core.PoolSpec, prev core.Pool, obs core.Observer) (core.Pool, error) {
+	// The caller has validated the spec already; checking again costs
+	// microseconds per reload and keeps a zero interval or weight from
+	// surfacing as a panic inside a health-check goroutine.
 	err := spec.Validate()
 	if err != nil {
 		return nil, fmt.Errorf("build pool: %w", err)
@@ -32,52 +51,37 @@ func New(spec core.PoolSpec, prev core.Pool, obs core.Observer) (core.Pool, erro
 	if obs == nil {
 		obs = func(core.Event) {}
 	}
-	p := &pool{backends: carryOver(spec.Backends, prev)}
+	p := &pool{
+		name:          spec.Name,
+		backends:      carryOver(spec.Backends, prev),
+		observer:      obs,
+		resetHealth:   spec.Health.Type == core.CheckNone,
+		resetEjection: spec.Outlier.Disabled,
+	}
 	p.balancer, err = balancer.New(spec.Policy, p.backends)
 	if err != nil {
 		return nil, fmt.Errorf("build pool %q: %w", spec.Name, err)
 	}
-
-	p.startOutlier(spec, prev, obs)
-	p.startChecker(spec, obs)
+	old, _ := prev.(*pool)
+	if !spec.Outlier.Disabled {
+		cfg := health.OutlierConfig{Pool: spec.Name, Spec: spec.Outlier, Backends: p.backends, Observer: obs}
+		if old != nil {
+			cfg.Prev = old.outlier
+		}
+		p.outlier = health.NewOutlier(cfg)
+	}
+	if spec.Health.Type != core.CheckNone {
+		p.checker = health.StartChecker(health.CheckerConfig{Pool: spec.Name, Spec: spec.Health, Backends: p.backends, Observer: obs})
+	}
+	// The reset runs now so the new pool is usable at once, and again when
+	// the previous pool is closed: until then its checker is still running
+	// and can mark a shared backend down after this reset, with nothing in
+	// this pool to bring it back.
+	p.resetCarriedState()
+	if old != nil {
+		old.successor.Store(p)
+	}
 	return p, nil
-}
-
-// startOutlier and startChecker also reset state carried over from the
-// previous pool that the new spec could never undo: with the outlier
-// detector off nothing would clear an ejection deadline, and with no health
-// check nothing would mark a backend healthy again.
-func (p *pool) startOutlier(spec core.PoolSpec, prev core.Pool, obs core.Observer) {
-	if spec.Outlier.Disabled {
-		for _, b := range p.backends {
-			b.Eject(0)
-		}
-		return
-	}
-	p.outlier = health.NewOutlier(health.OutlierConfig{
-		Pool:     spec.Name,
-		Spec:     spec.Outlier,
-		Backends: p.backends,
-		Observer: obs,
-		Prev:     previousOutlier(prev),
-	})
-}
-
-func (p *pool) startChecker(spec core.PoolSpec, obs core.Observer) {
-	if spec.Health.Type == core.CheckNone {
-		for _, b := range p.backends {
-			if b.SetHealthy(true) {
-				obs(core.Event{Pool: spec.Name, Backend: b, Kind: core.BackendUp})
-			}
-		}
-		return
-	}
-	p.checker = health.StartChecker(health.CheckerConfig{
-		Pool:     spec.Name,
-		Spec:     spec.Health,
-		Backends: p.backends,
-		Observer: obs,
-	})
 }
 
 func (p *pool) Pick(info core.PickInfo) *core.Backend {
@@ -88,15 +92,17 @@ func (p *pool) Pick(info core.PickInfo) *core.Backend {
 	return b
 }
 
-// Done does not sample the latency of a failed attempt: a connection refused
-// in microseconds would make a broken backend look like the fastest one to
-// p2c_ewma. Failures reach the outlier detector instead.
+// Done samples a failed attempt at no less than failurePenalty, even when
+// the caller gave no latency for it, and reports it to the outlier detector.
 func (p *pool) Done(b *core.Backend, res core.Result) {
 	if b == nil {
 		return
 	}
 	b.Release()
-	if res.Latency > 0 && !res.Failed {
+	switch {
+	case res.Failed:
+		b.ObserveLatency(max(res.Latency, failurePenalty))
+	case res.Latency > 0:
 		b.ObserveLatency(res.Latency)
 	}
 	if p.outlier != nil {
@@ -111,7 +117,25 @@ func (p *pool) Close() {
 		if p.checker != nil {
 			p.checker.Close()
 		}
+		// This pool's checker can no longer write, so the successor's
+		// reset now sticks.
+		if next := p.successor.Load(); next != nil {
+			next.resetCarriedState()
+		}
 	})
+}
+
+// resetCarriedState clears state inherited on reused backends that this
+// pool's configuration could never undo.
+func (p *pool) resetCarriedState() {
+	for _, b := range p.backends {
+		if p.resetEjection {
+			b.Eject(0)
+		}
+		if p.resetHealth && b.SetHealthy(true) {
+			p.observer(core.Event{Pool: p.name, Backend: b, Kind: core.BackendUp})
+		}
+	}
 }
 
 // carryOver returns the backends for specs in config order, taking the
@@ -132,14 +156,4 @@ func carryOver(specs []core.BackendSpec, prev core.Pool) []*core.Backend {
 		backends[i] = core.NewBackend(s.Addr, s.Weight)
 	}
 	return backends
-}
-
-// previousOutlier returns the detector to inherit failure streaks from, or
-// nil when prev is absent, is another Pool implementation, or had none.
-func previousOutlier(prev core.Pool) *health.Outlier {
-	old, ok := prev.(*pool)
-	if !ok {
-		return nil
-	}
-	return old.outlier
 }

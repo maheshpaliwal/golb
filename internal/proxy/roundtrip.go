@@ -7,15 +7,12 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/maheshpaliwal/golb/internal/core"
 )
-
-// discardLimit is how much of a retried response is read so its connection
-// can be reused; a larger body is cheaper to drop with the connection.
-const discardLimit = 4 << 10
 
 // RoundTrip sends the request to a backend of the route's pool and retries
 // on another one when that is safe:
@@ -23,23 +20,24 @@ const discardLimit = 4 << 10
 //   - a failed connect is retried for any method, because nothing was sent;
 //   - any other error, and the configured statuses, are retried only for an
 //     idempotent method without a body and never for an upgrade;
-//   - the client going away is not a failure and is never retried.
+//   - a failure caused by the client (it went away, its body was malformed
+//     or stalled) is neither retried nor held against the backend.
 //
 // Nothing has been written to the client while RoundTrip runs, so a retry
 // can never follow response bytes.
 func (x *exchange) RoundTrip(req *http.Request) (*http.Response, error) {
 	u := x.route.upstream
-	second := uint64(x.start.Unix())
-	u.budget.recordRequest(second)
+	u.budget.recordRequest(uint64(x.start.Unix()))
 
 	info := core.PickInfo{}
 	if u.ringHash {
 		info.Key = affinityKey(req, u.hashHeader)
 	}
 	var sent *requestBody
-	if req.Body != nil && req.Body != http.NoBody && u.maxAttempts > 1 {
-		sent = &requestBody{ReadCloser: req.Body}
+	if req.Body != nil && req.Body != http.NoBody {
+		sent = &requestBody{ReadCloser: req.Body, start: x.start}
 		req.Body = sent
+		x.sent.Store(sent)
 	}
 
 	b := u.pool.Pick(info)
@@ -50,31 +48,42 @@ func (x *exchange) RoundTrip(req *http.Request) (*http.Response, error) {
 	for {
 		x.attempts++
 		x.backend = b
-		try := x.newAttempt(req, b, began)
-		res, err := u.transport.RoundTrip(try.request)
+		try := x.newAttempt(req, b, sent, began)
+		res, err := u.conns.transport.RoundTrip(try.request)
+		err = try.settle(res, err)
+		if err == nil && !x.retriableStatus(req, res.StatusCode) {
+			return x.deliver(res, delivery{backend: b, sent: sent, began: began, cancel: try.cancel, bounded: try.limit != nil}), nil
+		}
+
 		elapsed := time.Since(x.start)
 		latency := elapsed - began
-		err = try.settle(res, err)
-
-		if err == nil && !x.retriableStatus(req, res.StatusCode) {
-			return x.deliver(res, b, latency, try.cancel), nil
-		}
-		if err != nil && req.Context().Err() != nil {
-			u.abandon(b)
-			return nil, err
+		if err != nil {
+			fault := x.clientFault(req, sent, err)
+			if fault != nil {
+				u.abandon(b)
+				return nil, fault
+			}
 		}
 
 		var next *core.Backend
-		if x.retriable(req, sent, err) && elapsed < x.deadline() && x.reserveRetry(second) {
+		if x.retriable(req, sent, err) && elapsed < x.deadline() {
 			x.tried = append(x.tried, b)
 			info.Exclude = x.tried
 			next = u.pool.Pick(info)
 		}
+		// The budget is spent only on a retry that will really be sent.
+		if next != nil && !u.budget.allowRetry(uint64(x.start.Add(elapsed).Unix())) {
+			u.budgetExhausted.Inc()
+			u.abandon(next)
+			next = nil
+		}
 		if next == nil && err == nil {
-			return x.deliver(res, b, latency, try.cancel), nil
+			return x.deliver(res, delivery{backend: b, sent: sent, began: began, cancel: try.cancel, latency: latency}), nil
 		}
 		if err == nil {
-			discard(res.Body)
+			// Closed unread: draining it could block on a backend that
+			// stalls after its headers, and the retry must not wait for that.
+			_ = res.Body.Close()
 			try.release()
 		}
 		u.done(b, latency, true)
@@ -87,22 +96,73 @@ func (x *exchange) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 }
 
+// clientFault reports whether a failed try is the client's doing, returning
+// the error to answer with. Such a try says nothing about the backend.
+func (x *exchange) clientFault(req *http.Request, sent *requestBody, err error) error {
+	if x.expired.Load() {
+		return errClientStalled
+	}
+	if req.Context().Err() != nil {
+		return err
+	}
+	if sent != nil && sent.failed.Load() {
+		return errClientBody
+	}
+	return nil
+}
+
 // attempt is one try against one backend.
 type attempt struct {
 	request *http.Request
-	parent  context.Context
-	ctx     context.Context
 	cancel  context.CancelFunc
+	limit   *tryLimit // nil when the try cannot overrun the request timeout
+}
+
+// tryLimit cancels a try that would overrun the request timeout. The time
+// the client spends uploading the body is not the pool's and does not
+// count: while the upload runs (the watchdog polices that) the limit is
+// pushed back, and afterwards the try gets what was left when it began.
+type tryLimit struct {
+	mu      sync.Mutex
 	timer   *time.Timer
+	cancel  context.CancelFunc
+	sent    *requestBody
+	start   time.Time
+	began   time.Duration // offset of the try from the request start
+	budget  time.Duration // what the try may spend waiting for the pool
+	settled bool
+	fired   bool
+}
+
+func (l *tryLimit) check() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.settled {
+		return
+	}
+	if l.sent != nil && !l.sent.done.Load() {
+		l.timer.Reset(l.budget)
+		return
+	}
+	waited := time.Since(l.start) - l.began
+	if l.sent != nil {
+		waited = time.Since(l.start) - max(l.began, time.Duration(l.sent.doneAt.Load()))
+	}
+	if waited < l.budget {
+		l.timer.Reset(l.budget - waited)
+		return
+	}
+	l.fired = true
+	l.cancel()
 }
 
 // newAttempt points the request at b. The first try reuses the outbound
 // request; a retry gets its own copy because the transport may still hold
 // the previous one. A try that could overrun the request timeout runs under
-// a timer that cancels it.
-func (x *exchange) newAttempt(req *http.Request, b *core.Backend, began time.Duration) attempt {
+// a tryLimit.
+func (x *exchange) newAttempt(req *http.Request, b *core.Backend, sent *requestBody, began time.Duration) attempt {
 	u := x.route.upstream
-	try := attempt{request: req, parent: req.Context()}
+	try := attempt{request: req}
 	remaining := x.deadline() - began
 	bounded := x.route.requestTimeout > 0 && remaining < u.dialTimeout+u.perTry
 	if x.attempts == 1 && !bounded {
@@ -110,11 +170,13 @@ func (x *exchange) newAttempt(req *http.Request, b *core.Backend, began time.Dur
 		return try
 	}
 
-	ctx := try.parent
+	ctx := req.Context()
 	if bounded {
-		try.ctx, try.cancel = context.WithCancel(ctx)
-		try.timer = time.AfterFunc(remaining, try.cancel)
-		ctx = try.ctx
+		ctx, try.cancel = context.WithCancel(ctx)
+		try.limit = &tryLimit{cancel: try.cancel, sent: sent, start: x.start, began: began, budget: remaining}
+		try.limit.mu.Lock()
+		try.limit.timer = time.AfterFunc(remaining, try.limit.check)
+		try.limit.mu.Unlock()
 	}
 	target := *req.URL
 	target.Host = b.Addr
@@ -123,24 +185,27 @@ func (x *exchange) newAttempt(req *http.Request, b *core.Backend, began time.Dur
 	return try
 }
 
-// settle stops the request-timeout timer once response headers (or an
-// error) are in, and reports a timer that fired as errRequestTimeout. On
-// success the cancel function stays armed for the body: cancelling when the
-// headers arrive would truncate the response.
+// settle stops the try's limit once response headers (or an error) are in,
+// and reports a limit that fired as errRequestTimeout. On success the
+// cancel function stays armed for the body: cancelling when the headers
+// arrive would truncate the response.
 func (a *attempt) settle(res *http.Response, err error) error {
-	if a.timer == nil {
+	if a.limit == nil {
 		return err
 	}
-	stopped := a.timer.Stop()
-	if stopped && err == nil {
+	a.limit.mu.Lock()
+	a.limit.settled = true
+	fired := a.limit.fired
+	a.limit.mu.Unlock()
+	a.limit.timer.Stop()
+	if !fired && err == nil {
 		return nil
 	}
-	expired := !stopped || (a.ctx.Err() != nil && a.parent.Err() == nil)
 	if err == nil {
-		res.Body.Close()
+		_ = res.Body.Close()
 	}
 	a.release()
-	if expired {
+	if fired {
 		return errRequestTimeout
 	}
 	return err
@@ -179,7 +244,7 @@ func (x *exchange) retriable(req *http.Request, sent *requestBody, err error) bo
 		return true
 	}
 	if isDialError(err) {
-		return sent == nil || !sent.read.Load()
+		return sent == nil || !sent.touched.Load()
 	}
 	return repeatable(req)
 }
@@ -200,42 +265,57 @@ func repeatable(req *http.Request) bool {
 	return false
 }
 
-func (x *exchange) reserveRetry(second uint64) bool {
-	u := x.route.upstream
-	if u.budget.allowRetry(second) {
-		return true
-	}
-	u.budgetExhausted.Inc()
-	return false
+// delivery is a response accepted for the client and the attempt behind it.
+type delivery struct {
+	backend *core.Backend
+	sent    *requestBody
+	began   time.Duration
+	latency time.Duration // 0 when not measured yet
+	cancel  context.CancelFunc
+	bounded bool // the attempt ran under the request-timeout timer
 }
 
-// deliver hands the response to ReverseProxy with a body that reports the
-// attempt to the pool when it is closed.
-func (x *exchange) deliver(res *http.Response, b *core.Backend, latency time.Duration, cancel context.CancelFunc) *http.Response {
+// deliver hands the response to ReverseProxy and arranges for the attempt
+// to be reported to the pool exactly once: when the body is closed, or at
+// the end of the request for a response without one.
+//
+// The clock is read here only when the time to the headers differs from the
+// time to the end of the response. For a first-try response that fits one
+// copy buffer the two are the same to within the copy, so the reading taken
+// when the body closes serves as both the latency sample and the request
+// duration.
+func (x *exchange) deliver(res *http.Response, d delivery) *http.Response {
+	x.upstreamStatus = res.StatusCode
+	failed := res.StatusCode >= http.StatusInternalServerError
+	if res.Body == http.NoBody && d.cancel == nil && d.latency == 0 {
+		x.owed = owedResult{backend: d.backend, began: d.began, failed: failed}
+		return res
+	}
+	short := d.began == 0 && !d.bounded && !failed && res.ContentLength >= 0 && res.ContentLength <= copyBufferBytes
+	if d.latency == 0 && !short {
+		d.latency = max(time.Since(x.start)-d.began, 1)
+	}
 	body := &upstreamBody{
 		ReadCloser: res.Body,
 		upstream:   x.route.upstream,
-		backend:    b,
-		latency:    latency,
-		failed:     res.StatusCode >= http.StatusInternalServerError,
-		cancel:     cancel,
+		backend:    d.backend,
+		sent:       d.sent,
+		start:      x.start,
+		latency:    d.latency,
+		failed:     failed,
+		cancel:     d.cancel,
 	}
-	x.body = body
-	x.upstreamStatus = res.StatusCode
 	res.Body = body
 	conn, ok := body.ReadCloser.(io.ReadWriteCloser)
 	if ok && res.StatusCode == http.StatusSwitchingProtocols {
-		// An upgraded connection: ReverseProxy needs to write to it too.
-		body.upgraded = true
+		// An upgraded connection: ReverseProxy needs to write to it too,
+		// and Drain needs to find it.
+		body.upgrades = x.handler
+		x.handler.track(body)
 		res.Body = &upgradedBody{upstreamBody: body, conn: conn}
 	}
+	x.body.Store(body)
 	return res
-}
-
-func discard(body io.ReadCloser) {
-	// Both errors only decide whether the connection is reused.
-	_, _ = io.CopyN(io.Discard, body, discardLimit)
-	_ = body.Close()
 }
 
 // affinityKey hashes the configured header, or the client IP when the
@@ -254,41 +334,67 @@ func affinityKey(req *http.Request, header string) uint64 {
 	return core.Hash(host)
 }
 
-// requestBody shields the client's body from the transport, which closes
-// the body of every failed try, and records whether any of it was consumed.
-// The server closes the real body when the handler returns.
+// requestBody stands between the transport and the client's body. It keeps
+// the transport from closing the body on a failed try (the server closes it
+// when the handler returns), and it records what the retry rules, the
+// watchdog and the failure classification need to know.
 type requestBody struct {
 	io.ReadCloser
-	read atomic.Bool
+	touched atomic.Bool  // a read was attempted: the body cannot be replayed
+	n       atomic.Int64 // bytes read, the watchdog's measure of progress
+	done    atomic.Bool  // the body ended, cleanly or not
+	doneAt  atomic.Int64 // when it ended, as an offset from start
+	start   time.Time
+	failed  atomic.Bool // reading it failed: a client fault, never a backend's
 }
 
 func (b *requestBody) Read(p []byte) (int, error) {
-	b.read.Store(true)
-	return b.ReadCloser.Read(p)
+	b.touched.Store(true)
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.n.Add(int64(n))
+	}
+	if err != nil {
+		if err != io.EOF {
+			b.failed.Store(true)
+		}
+		b.doneAt.Store(int64(time.Since(b.start)))
+		b.done.Store(true)
+	}
+	return n, err
 }
 
 func (b *requestBody) Close() error { return nil }
 
 // upstreamBody releases the backend exactly once, when the response body is
 // closed. It is never pooled: after an upgrade a copy goroutine can still
-// hold it when the handler has returned.
+// hold it when the handler has returned, and the watchdog or Drain may close
+// it from another goroutine.
 type upstreamBody struct {
 	io.ReadCloser
 	upstream *Upstream
 	backend  *core.Backend
-	latency  time.Duration
+	sent     *requestBody
+	upgrades *Handler // set for an upgraded connection
+	start    time.Time
+	latency  time.Duration // 0: measured when the body closes
 	failed   bool
-	upgraded bool
 	cancel   context.CancelFunc
-	broken   atomic.Bool
-	closed   atomic.Bool
+
+	n       atomic.Int64 // bytes moved, the watchdog's measure of progress
+	elapsed atomic.Int64 // request duration read at Close, when latency was 0
+	broken  atomic.Bool
+	closed  atomic.Bool
 }
 
 func (b *upstreamBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.n.Add(int64(n))
+	}
 	// A backend that dies mid-response counts against it; the client going
 	// away, or an upgraded connection ending, does not.
-	if err != nil && err != io.EOF && !b.upgraded && !errors.Is(err, context.Canceled) {
+	if err != nil && err != io.EOF && b.upgrades == nil && !errors.Is(err, context.Canceled) {
 		b.broken.Store(true)
 	}
 	return n, err
@@ -302,7 +408,18 @@ func (b *upstreamBody) Close() error {
 	if b.cancel != nil {
 		b.cancel()
 	}
-	b.upstream.done(b.backend, b.latency, b.failed || b.broken.Load())
+	latency := b.latency
+	if latency == 0 {
+		latency = max(time.Since(b.start), 1)
+		b.elapsed.Store(int64(latency))
+	}
+	// A broken request body takes the upstream exchange down with it; that
+	// is the client's failure.
+	clientFault := b.sent != nil && b.sent.failed.Load()
+	b.upstream.done(b.backend, latency, (b.failed || b.broken.Load()) && !clientFault)
+	if b.upgrades != nil {
+		b.upgrades.untrack(b)
+	}
 	return err
 }
 
@@ -313,7 +430,13 @@ type upgradedBody struct {
 	conn io.ReadWriteCloser
 }
 
-func (b *upgradedBody) Write(p []byte) (int, error) { return b.conn.Write(p) }
+func (b *upgradedBody) Write(p []byte) (int, error) {
+	n, err := b.conn.Write(p)
+	if n > 0 {
+		b.n.Add(int64(n))
+	}
+	return n, err
+}
 
 // CloseWrite lets ReverseProxy pass a client half-close on to the backend.
 func (b *upgradedBody) CloseWrite() error {

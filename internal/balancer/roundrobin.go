@@ -6,12 +6,20 @@ import (
 	"github.com/maheshpaliwal/golb/internal/core"
 )
 
+// cacheLine is the largest line size among supported CPUs (Apple arm64).
+const cacheLine = 128
+
 // roundRobin steps an atomic counter through a precomputed schedule in which
 // each backend appears weight/GCD times, interleaved smoothly.
 type roundRobin struct {
 	backends []*core.Backend
 	schedule []*core.Backend
-	next     atomic.Uint64
+	// The counter is written on every pick; the padding keeps those writes
+	// from invalidating the line that holds the read-only slice headers.
+	_       [cacheLine]byte
+	next    atomic.Uint64
+	retries atomic.Uint64
+	_       [cacheLine]byte
 }
 
 func newRoundRobin(backends []*core.Backend) *roundRobin {
@@ -19,35 +27,52 @@ func newRoundRobin(backends []*core.Backend) *roundRobin {
 }
 
 func (r *roundRobin) Pick(info core.PickInfo) *core.Backend {
-	slot := r.next.Add(1) - 1
-	b := r.schedule[slot%uint64(len(r.schedule))]
-	if usable(b, info.Exclude) {
+	if len(info.Exclude) != 0 {
+		return r.pickRetry(info.Exclude)
+	}
+	b := r.schedule[(r.next.Add(1)-1)%uint64(len(r.schedule))]
+	if available(b) {
 		return b
 	}
-	return r.pickSkipping(slot, info.Exclude)
+	return r.redraw()
 }
 
-// pickSkipping walks the schedule past unusable backends, which keeps the
-// weight ratio among the rest. The walk is bounded by the backend count, not
-// the schedule length, so a pool with one heavy dead backend does not scan
-// hundreds of slots; a direct scan then guarantees nil only when nothing is
-// usable.
-func (r *roundRobin) pickSkipping(slot uint64, exclude []*core.Backend) *core.Backend {
+// redraw takes further slots from the counter until one holds an available
+// backend. Every slot of an unavailable backend is passed over this way, so
+// the available ones are picked in the ratio of their own slots; handing a
+// skipped slot to the next backend in order would give that neighbour the
+// whole share of the one that is down.
+func (r *roundRobin) redraw() *core.Backend {
+	if !anyAvailable(r.backends) {
+		return nil
+	}
 	slots := uint64(len(r.schedule))
-	for step := uint64(1); step <= uint64(len(r.backends)); step++ {
+	for range slots {
+		b := r.schedule[(r.next.Add(1)-1)%slots]
+		if available(b) {
+			return b
+		}
+	}
+	// A full cycle of draws passes every slot unless concurrent picks took
+	// some of them; a direct scan settles that case.
+	return firstUsable(r.backends, 0, nil)
+}
+
+// pickRetry serves a retry without advancing the main counter. If retries
+// consumed its slots, a pool of two with one failing backend that is not yet
+// ejected would start every request on the failing one: first attempt and
+// retry together take two slots, which brings the counter back to it.
+// Retries step their own counter so that a burst of them spreads out.
+func (r *roundRobin) pickRetry(exclude []*core.Backend) *core.Backend {
+	slots := uint64(len(r.schedule))
+	slot := r.next.Load() + r.retries.Add(1)
+	for step := range uint64(len(r.backends)) {
 		b := r.schedule[(slot+step)%slots]
 		if usable(b, exclude) {
 			return b
 		}
 	}
-	start := int(slot % uint64(len(r.backends)))
-	for i := range r.backends {
-		b := r.backends[(start+i)%len(r.backends)]
-		if usable(b, exclude) {
-			return b
-		}
-	}
-	return nil
+	return firstUsable(r.backends, int(slot%uint64(len(r.backends))), exclude)
 }
 
 // smoothSchedule is nginx's smooth weighted round robin run for one full

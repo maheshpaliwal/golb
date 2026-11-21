@@ -226,9 +226,6 @@ func TestFileChangeIsPickedUpByTheWatcher(t *testing.T) {
 // takes its first look must still be loaded: the watcher exists so that the
 // running config follows the file.
 func TestFileChangedDuringStartupIsPickedUp(t *testing.T) {
-	knownBug(t, "BUG: a config file modified between start-up's read and the file watcher's first poll is never loaded; "+
-		"the watcher takes the changed file as its starting point and only reacts to a later modification "+
-		"(also the cause of the flaky internal/server TestFileWatcherReloads)")
 	backends := newBackends(t, 2)
 	listen := "addr: " + deadAddr(t)
 	path := filepath.Join(t.TempDir(), "golb.yaml")
@@ -350,9 +347,6 @@ func TestRateLimitReturns429AndRecovers(t *testing.T) {
 // on the old transport, and that connection is then parked in an idle pool
 // nothing will close.
 func TestUpstreamConnectionsOfReplacedTransportAreClosed(t *testing.T) {
-	knownBug(t, "BUG: a request that races with a reload changing transport settings leaves its upstream connection in the "+
-		"replaced transport's idle pool; such connections stay open until idle_conn_timeout (90 s by default) and are "+
-		"still open after Shutdown returns")
 	const (
 		workers = 16
 		reloads = 40

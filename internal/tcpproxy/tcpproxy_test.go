@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,3 +361,52 @@ func TestShutdown(t *testing.T) {
 		})
 	}
 }
+
+// An open connection that is not moving bytes must not hold a pooled copy
+// buffer; a bulk transfer borrows them and gives them back.
+func TestCopyBuffersAreHeldOnlyWhileCopying(t *testing.T) {
+	var held atomic.Int64
+	original := copyBuffers
+	copyBuffers = &countingBuffers{held: &held}
+	t.Cleanup(func() { copyBuffers = original })
+
+	f := start(t, "30s", tcpBackend(t, echo))
+	conn := f.dial(t)
+	exchange := func(message string) {
+		t.Helper()
+		go io.WriteString(conn, message)
+		_, err := io.ReadFull(conn, make([]byte, len(message)))
+		if err != nil {
+			t.Fatalf("echo of %d bytes: %v", len(message), err)
+		}
+	}
+	settle := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(waitLimit)
+		for held.Load() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: %d copy buffers still held by an idle connection, want 0", what, held.Load())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	exchange("small message")
+	settle("after a small message")
+	exchange(strings.Repeat("x", 1<<20))
+	settle("after a bulk transfer")
+	if got := f.registry.Counter("golb_tcp_bytes_total", "", "listener", "raw", "direction", "out").Value(); got != 13+1<<20 {
+		t.Errorf("bytes out = %d, want %d", got, 13+1<<20)
+	}
+}
+
+type countingBuffers struct {
+	held *atomic.Int64
+}
+
+func (c *countingBuffers) Get() any {
+	c.held.Add(1)
+	return new([copyBufferBytes]byte)
+}
+
+func (c *countingBuffers) Put(any) { c.held.Add(-1) }

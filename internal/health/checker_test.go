@@ -18,8 +18,11 @@ const (
 	// timeout; the timeout test sets its own.
 	testTimeout  = time.Second
 	shortTimeout = 5 * time.Millisecond
-	pollDeadline = 5 * time.Second
-	pollStep     = time.Millisecond
+	// quietIntervals is how many probe intervals must pass without a probe
+	// to conclude that probing has stopped.
+	quietIntervals = 6
+	pollDeadline   = 5 * time.Second
+	pollStep       = time.Millisecond
 )
 
 // eventually polls cond until it holds or the deadline passes.
@@ -319,7 +322,7 @@ func TestCheckerCloseLeavesNoGoroutines(t *testing.T) {
 			}
 			before := runtime.NumGoroutine()
 
-			checker := StartChecker(CheckerConfig{Pool: "app", Spec: spec, Backends: backends})
+			checker := StartChecker(CheckerConfig{Pool: "app", Spec: spec, Backends: backends, Observer: discard})
 			if spec.Type == core.CheckHTTP {
 				// With a one-minute interval the start jitter can be long, so
 				// only wait for a probe when probes are frequent.
@@ -338,13 +341,17 @@ func TestCheckerCloseLeavesNoGoroutines(t *testing.T) {
 			case <-time.After(pollDeadline):
 				t.Fatal("Close did not return")
 			}
-			probesAtClose := fakes[1].probes.Load()
 
-			// Server-side connection goroutines end shortly after the
-			// checker's side closes; the checker's own are gone already.
+			// The checker's goroutines are gone when Close returns, but a
+			// request it had already written may still be on its way through
+			// the server. The count is therefore taken once the server's
+			// connection goroutines have ended too, and must then stay put
+			// for several probe intervals.
 			eventually(t, "goroutines to return to the baseline", func() bool { return runtime.NumGoroutine() <= before })
-			if got := fakes[1].probes.Load(); got != probesAtClose {
-				t.Errorf("got %d probes after Close, want none", got-probesAtClose)
+			settled := fakes[1].probes.Load()
+			time.Sleep(quietIntervals * testInterval)
+			if got := fakes[1].probes.Load(); got != settled {
+				t.Errorf("got %d probes after Close and after the server went quiet, want none", got-settled)
 			}
 		})
 	}
@@ -353,7 +360,7 @@ func TestCheckerCloseLeavesNoGoroutines(t *testing.T) {
 func TestCheckerWithoutCheckTypeStartsNothing(t *testing.T) {
 	backend := core.NewBackend("127.0.0.1:1", 1)
 	before := runtime.NumGoroutine()
-	checker := StartChecker(CheckerConfig{Pool: "app", Spec: core.HealthCheck{}, Backends: []*core.Backend{backend}})
+	checker := StartChecker(CheckerConfig{Pool: "app", Spec: core.HealthCheck{}, Backends: []*core.Backend{backend}, Observer: discard})
 	if got := runtime.NumGoroutine(); got != before {
 		t.Errorf("got %d goroutines started without a check type, want 0", got-before)
 	}

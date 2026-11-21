@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,10 @@ const (
 
 	resultOK    = "ok"
 	resultError = "error"
+
+	metricBackendInflight  = "golb_backend_inflight"
+	metricBackendHealthy   = "golb_backend_healthy"
+	metricBackendEjections = "golb_backend_ejections_total"
 
 	reloadHelp = "Configuration reloads by result."
 )
@@ -91,6 +96,7 @@ type frontend struct {
 	name     string
 	listener net.Listener
 	http     *http.Server    // HTTP and admin listeners
+	proxy    *proxy.Handler  // HTTP listeners: knows the upgraded connections
 	tcp      *tcpproxy.Proxy // TCP listeners
 }
 
@@ -107,12 +113,11 @@ func New(ctx context.Context, opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		path:       opts.ConfigPath,
-		logger:     opts.Logger,
-		registry:   metrics.NewRegistry(),
-		watch:      opts.WatchInterval,
-		loadedHash: sha256.Sum256(data),
-		failures:   make(chan error, len(cfg.Listeners)+1),
+		path:     opts.ConfigPath,
+		logger:   opts.Logger,
+		registry: metrics.NewRegistry(),
+		watch:    opts.WatchInterval,
+		failures: make(chan error, len(cfg.Listeners)+1),
 	}
 	if s.watch == 0 {
 		s.watch = defaultWatchInterval
@@ -136,6 +141,7 @@ func New(ctx context.Context, opts Options) (*Server, error) {
 		return nil, err
 	}
 	s.current.Store(snap)
+	s.loadedHash = fingerprint(data, snap.watched())
 	err = s.bind(cfg)
 	if err != nil {
 		s.abandon(snap)
@@ -190,7 +196,8 @@ func (s *Server) bind(cfg *config.Config) error {
 				},
 			})
 		}
-		fe.http = s.httpServer(i, listener)
+		fe.proxy = proxy.NewHandler(func() *proxy.Router { return s.current.Load().routers[i] }, s.logger)
+		fe.http = s.httpServer(fe.proxy, listener)
 	}
 
 	if !cfg.Admin.Enabled() {
@@ -209,6 +216,10 @@ func (s *Server) bind(cfg *config.Config) error {
 				Registry: s.registry,
 				Pprof:    cfg.Admin.Pprof,
 				Logger:   s.logger,
+				Addr:     cfg.Admin.Addr,
+				// An operator who exposed the admin listener reaches it by
+				// names golb cannot know; protecting it is then their job.
+				AnyHost: cfg.Admin.AllowNonLoopback,
 			}),
 			ReadHeaderTimeout: adminReadHeaderTimeout,
 			ReadTimeout:       adminReadTimeout,
@@ -221,17 +232,17 @@ func (s *Server) bind(cfg *config.Config) error {
 	return nil
 }
 
-func (s *Server) httpServer(index int, listener config.Listener) *http.Server {
+func (s *Server) httpServer(handler http.Handler, listener config.Listener) *http.Server {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetHTTP2(true)
 	protocols.SetUnencryptedHTTP2(listener.H2C)
-	source := func() *proxy.Router { return s.current.Load().routers[index] }
 	return &http.Server{
-		Handler: proxy.NewHandler(source, s.logger),
+		Handler: handler,
 		// No ReadTimeout or WriteTimeout: they would cut off streaming
 		// bodies and upgraded connections. Slow headers are bounded here,
-		// slow upstreams by the pool's timeouts.
+		// slow or stalled bodies by the proxy handler's watchdog, slow
+		// upstreams by the pool's timeouts.
 		ReadHeaderTimeout: listener.Timeouts.ReadHeader,
 		IdleTimeout:       listener.Timeouts.Idle,
 		MaxHeaderBytes:    listener.Timeouts.MaxHeaderBytes,
@@ -330,7 +341,7 @@ func (s *Server) reloadIfChanged(ctx context.Context) {
 		// Editors and deploy tools replace files by rename; the next poll retries.
 		return
 	}
-	if sha256.Sum256(data) == s.loadedHash {
+	if fingerprint(data, s.current.Load().watched()) == s.loadedHash {
 		return
 	}
 	// The error is already logged and counted by apply.
@@ -341,7 +352,9 @@ func (s *Server) apply(ctx context.Context, data []byte) error {
 	if s.draining.Load() {
 		return errDraining
 	}
-	s.loadedHash = sha256.Sum256(data)
+	// Whatever the outcome, this content has now been tried: the watcher
+	// must not offer it again until a file changes.
+	defer func() { s.loadedHash = fingerprint(data, s.current.Load().watched()) }()
 	err := ctx.Err()
 	if err != nil {
 		return s.reloadFailed(err)
@@ -365,6 +378,7 @@ func (s *Server) apply(ctx context.Context, data []byte) error {
 	s.accessLog.SetSampleRate(cfg.AccessLog.SampleRate)
 	s.current.Store(next)
 	running.retire(next)
+	s.forget(running, next)
 	s.reloadOK.Inc()
 	s.lastReload.Set(time.Now().Unix())
 	s.logger.Info("configuration reloaded", "path", s.path)
@@ -427,41 +441,46 @@ func (s *Server) drain(ctx context.Context, fe *frontend) error {
 		return nil
 	}
 	err := fe.http.Shutdown(ctx)
-	if err == nil {
+	if err != nil {
+		closeErr := fe.http.Close()
+		if closeErr != nil {
+			s.logger.Error("close listener", "listener", fe.name, "error", closeErr)
+		}
+		return fmt.Errorf("listener %q: requests cut off at the deadline: %w", fe.name, err)
+	}
+	if fe.proxy == nil {
 		return nil
 	}
-	closeErr := fe.http.Close()
-	if closeErr != nil {
-		s.logger.Error("close listener", "listener", fe.name, "error", closeErr)
+	// http.Server does not know about upgraded connections; they get the
+	// same grace period and are then closed.
+	err = fe.proxy.Drain(ctx)
+	if err != nil {
+		return fmt.Errorf("listener %q: upgraded connections closed at the deadline: %w", fe.name, err)
 	}
-	return fmt.Errorf("listener %q: requests cut off at the deadline: %w", fe.name, err)
+	return nil
 }
 
-// watchFile polls the config file's size and modification time. A change is
-// acted on one poll later, once the file has stopped changing, so a burst
-// of writes causes one reload.
+// watchFile polls the size and modification time of the config file and of
+// the certificate files it names. A change is acted on one poll later, once
+// the files have stopped changing, so a burst of writes causes one reload.
+//
+// The first comparison is against what start-up actually loaded, not
+// against the files as the watcher first finds them: a file replaced while
+// the process was starting must still be picked up.
 func (s *Server) watchFile() {
 	ticker := time.NewTicker(s.watch)
 	defer ticker.Stop()
-	var seen fileStamp
-	info, err := os.Stat(s.path)
-	if err == nil {
-		seen = stampOf(info)
-	}
-	pending := false
+	var seen []fileStamp
+	pending := true
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
 		}
-		info, err = os.Stat(s.path)
-		if err != nil {
-			continue
-		}
-		stamp := stampOf(info)
-		if stamp != seen {
-			seen = stamp
+		stamps := s.stamps()
+		if !slices.Equal(stamps, seen) {
+			seen = stamps
 			pending = true
 			continue
 		}
@@ -473,13 +492,43 @@ func (s *Server) watchFile() {
 	}
 }
 
+// fileStamp is zero for a file that cannot be read right now.
 type fileStamp struct {
 	size    int64
-	modTime time.Time
+	modTime int64
 }
 
-func stampOf(info os.FileInfo) fileStamp {
-	return fileStamp{size: info.Size(), modTime: info.ModTime()}
+func (s *Server) stamps() []fileStamp {
+	paths := append([]string{s.path}, s.current.Load().watched()...)
+	stamps := make([]fileStamp, len(paths))
+	for i, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			// Deploy tools replace files by rename; the next poll sees the result.
+			continue
+		}
+		stamps[i] = fileStamp{size: info.Size(), modTime: info.ModTime().UnixNano()}
+	}
+	return stamps
+}
+
+// fingerprint identifies a configuration together with the content of the
+// certificate files it uses, so a rotated certificate counts as a change.
+func fingerprint(data []byte, files []string) [sha256.Size]byte {
+	hash := sha256.New()
+	hash.Write(data)
+	for _, path := range files {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			// Unreadable is a state of its own, distinct from any content.
+			content = []byte(err.Error())
+		}
+		fmt.Fprintf(hash, "\n%s %d\n", path, len(content))
+		hash.Write(content)
+	}
+	var sum [sha256.Size]byte
+	hash.Sum(sum[:0])
+	return sum
 }
 
 // observe receives backend state changes from health checking. It runs on
@@ -498,16 +547,16 @@ func (s *Server) observe(ev core.Event) {
 }
 
 func (s *Server) ejections(pool, addr string) *metrics.Counter {
-	return s.registry.Counter("golb_backend_ejections_total", "Times a backend was ejected by outlier detection.",
+	return s.registry.Counter(metricBackendEjections, "Times a backend was ejected by outlier detection.",
 		"pool", pool, "backend", addr)
 }
 
 func (s *Server) registerBackendGauges(name string, pool core.Pool) {
 	for _, b := range pool.Backends() {
 		s.ejections(name, b.Addr)
-		s.registry.GaugeFunc("golb_backend_inflight", "Requests and connections in flight per backend.",
+		s.registry.GaugeFunc(metricBackendInflight, "Requests and connections in flight per backend.",
 			func() float64 { return float64(b.Inflight()) }, "pool", name, "backend", b.Addr)
-		s.registry.GaugeFunc("golb_backend_healthy", "1 when the backend passes its active health check, else 0.",
+		s.registry.GaugeFunc(metricBackendHealthy, "1 when the backend passes its active health check, else 0.",
 			func() float64 {
 				if b.Healthy() {
 					return 1

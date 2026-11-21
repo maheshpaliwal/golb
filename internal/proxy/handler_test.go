@@ -46,6 +46,13 @@ func TestForwardedHeaders(t *testing.T) {
 	req.Header.Set("X-Client-Hop", "1")
 	req.Header.Set("Proxy-Authorization", "Basic placeholder")
 	req.Header.Set("Te", "gzip")
+	spoofable := []string{
+		"X-Forwarded-Port", "X-Forwarded-Ssl", "X-Forwarded-Scheme", "X-Forwarded-Prefix", "X-Forwarded-Server",
+		"X-Forwarded-Anything-Else", "X-Real-Ip", "True-Client-Ip",
+	}
+	for _, name := range spoofable {
+		req.Header.Set(name, "spoofed")
+	}
 	req.Header.Set("X-Client-Kept", "yes")
 	res, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
@@ -71,6 +78,11 @@ func TestForwardedHeaders(t *testing.T) {
 	for _, h := range requestHeaders {
 		if values := strings.Join(got.Header.Values(h.name), "|"); values != h.want {
 			t.Errorf("backend saw %s = %q, want %q", h.name, values, h.want)
+		}
+	}
+	for _, name := range spoofable {
+		if values := got.Header.Values(name); len(values) != 0 {
+			t.Errorf("backend saw client-supplied %s = %q, want it removed", name, values)
 		}
 	}
 	if got.Host != "client.example.test" {
@@ -1023,10 +1035,10 @@ func TestUpstreamKeepsTransportAcrossReload(t *testing.T) {
 	same := build("    policy: round_robin\n", first)
 	retuned := build("    transport:\n      dial_timeout: 1s\n", same)
 
-	if same.transport != first.transport || same.budget != first.budget {
+	if same.conns != first.conns || same.budget != first.budget {
 		t.Error("unchanged transport settings built a new transport or budget; warm connections would be lost on reload")
 	}
-	if retuned.transport == same.transport {
+	if retuned.conns == same.conns {
 		t.Error("changed dial_timeout kept the old transport")
 	}
 	if retuned.budget != same.budget {

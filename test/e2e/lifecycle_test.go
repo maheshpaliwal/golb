@@ -685,9 +685,6 @@ func TestBinaryCheckFlag(t *testing.T) {
 // Like a TCP connection (PRD 4.5) it should get the grace period and then
 // be closed, so that Shutdown leaves nothing behind.
 func TestShutdownClosesUpgradedConnections(t *testing.T) {
-	knownBug(t, "BUG: Shutdown returns at once with a WebSocket connection open and never closes it: the connection keeps "+
-		"working after Shutdown returned, its goroutines and the backend's in-flight count are left behind "+
-		"(in the binary the connection is cut without notice when the process exits, with no grace period)")
 	ws := newBackend(t, "ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, rw, err := w.(http.Hijacker).Hijack()
 		if err != nil {

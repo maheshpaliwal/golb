@@ -31,6 +31,7 @@ type Route struct {
 	limit          config.RateLimit
 	limiter        *ratelimit.Bucket
 	requestTimeout time.Duration
+	bodyIdle       time.Duration
 
 	classes  [statusClasses]*metrics.Counter
 	duration *metrics.Histogram
@@ -79,6 +80,7 @@ func NewRouter(opts RouterOptions) *Router {
 		route.prefix = strings.TrimRight(cfg.PathPrefix, "/")
 		route.upstream = opts.Upstreams[cfg.Pool]
 		route.requestTimeout = listener.Timeouts.Request
+		route.bodyIdle = listener.Timeouts.BodyIdle
 		if cfg.RateLimit != nil {
 			route.limit = *cfg.RateLimit
 			route.limiter = ratelimit.New(cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst)

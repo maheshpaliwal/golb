@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"time"
 
 	"github.com/maheshpaliwal/golb/internal/core"
 )
@@ -34,7 +33,7 @@ func New(policy core.Policy, backends []*core.Backend) (core.Balancer, error) {
 	case core.RoundRobin:
 		return newRoundRobin(backends), nil
 	case core.LeastConn:
-		return &leastConn{backends: backends}, nil
+		return newLeastConn(backends), nil
 	case core.P2CEWMA:
 		return &p2cEWMA{backends: backends}, nil
 	case core.RingHash:
@@ -58,12 +57,32 @@ func usable(b *core.Backend, exclude []*core.Backend) bool {
 
 // available avoids reading the clock on the common path: Available(0) is
 // true exactly when the backend is healthy and carries no ejection deadline.
-// Only a backend with a deadline, current or expired, costs a time.Now.
+// Only a backend with a deadline, current or expired, costs a clock read.
 func available(b *core.Backend) bool {
 	if b.Available(0) {
 		return true
 	}
-	return b.Healthy() && !b.Ejected(time.Now().UnixNano())
+	return b.Healthy() && !b.Ejected(core.Now())
+}
+
+func anyAvailable(backends []*core.Backend) bool {
+	for _, b := range backends {
+		if available(b) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstUsable scans from start and returns nil only when nothing is usable.
+func firstUsable(backends []*core.Backend, start int, exclude []*core.Backend) *core.Backend {
+	for step := range backends {
+		b := backends[(start+step)%len(backends)]
+		if usable(b, exclude) {
+			return b
+		}
+	}
+	return nil
 }
 
 // weightUnits returns each backend's weight divided by the GCD of all

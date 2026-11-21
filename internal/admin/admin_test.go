@@ -98,6 +98,75 @@ func TestEndpoints(t *testing.T) {
 	}
 }
 
+func TestGuard(t *testing.T) {
+	tests := []struct {
+		name       string
+		addr       string
+		anyHost    bool
+		method     string
+		path       string
+		host       string
+		headers    map[string]string
+		wantStatus int
+		wantReload int
+	}{
+		{name: "loopback IP", method: http.MethodGet, path: "/metrics", host: "127.0.0.1:9901", wantStatus: 200},
+		{name: "IPv6 loopback", method: http.MethodGet, path: "/metrics", host: "[::1]:9901", wantStatus: 200},
+		{name: "localhost", method: http.MethodGet, path: "/metrics", host: "LocalHost:9901", wantStatus: 200},
+		{name: "configured host name", addr: "admin.golb.test:9901", method: http.MethodGet, path: "/metrics", host: "admin.golb.test:9901", wantStatus: 200},
+		{name: "rebound name reads nothing", method: http.MethodGet, path: "/metrics", host: "attacker.example.test:9901", wantStatus: 403},
+		{name: "rebound name reads no backends", method: http.MethodGet, path: "/backends", host: "attacker.example.test", wantStatus: 403},
+		{name: "rebound name cannot reload", method: http.MethodPost, path: "/reload", host: "attacker.example.test:9901", wantStatus: 403},
+		{name: "any host when the operator allows it", anyHost: true, method: http.MethodGet, path: "/metrics", host: "metrics.internal.test", wantStatus: 200},
+		{
+			name: "cross-site Origin cannot reload", method: http.MethodPost, path: "/reload", host: "127.0.0.1:9901",
+			headers: map[string]string{"Origin": "http://evil.example.test"}, wantStatus: 403,
+		},
+		{
+			name: "cross-site Origin cannot read", method: http.MethodGet, path: "/backends", host: "127.0.0.1:9901",
+			headers: map[string]string{"Origin": "http://evil.example.test"}, wantStatus: 403,
+		},
+		{
+			name: "opaque Origin", method: http.MethodPost, path: "/reload", host: "127.0.0.1:9901",
+			headers: map[string]string{"Origin": "null"}, wantStatus: 403,
+		},
+		{
+			name: "cross-site fetch metadata", method: http.MethodPost, path: "/reload", host: "127.0.0.1:9901",
+			headers: map[string]string{"Sec-Fetch-Site": "cross-site"}, wantStatus: 403,
+		},
+		{
+			name: "same-origin request", method: http.MethodPost, path: "/reload", host: "127.0.0.1:9901",
+			headers: map[string]string{"Origin": "http://127.0.0.1:9901", "Sec-Fetch-Site": "same-origin"}, wantStatus: 200, wantReload: 1,
+		},
+		{name: "plain tool request reloads", method: http.MethodPost, path: "/reload", host: "127.0.0.1:9901", wantStatus: 200, wantReload: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			source := new(stubSource)
+			handler := NewHandler(Options{
+				Source:   source,
+				Registry: metrics.NewRegistry(),
+				Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+				Addr:     tc.addr,
+				AnyHost:  tc.anyHost,
+			})
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Host = tc.host
+			for name, value := range tc.headers {
+				req.Header.Set(name, value)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if source.reloads != tc.wantReload {
+				t.Errorf("Reload called %d times, want %d", source.reloads, tc.wantReload)
+			}
+		})
+	}
+}
+
 func TestBackendsJSON(t *testing.T) {
 	server := serve(t, new(stubSource), false)
 	res, err := server.Client().Get(server.URL + "/backends")

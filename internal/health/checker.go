@@ -28,7 +28,7 @@ type CheckerConfig struct {
 	Pool     string
 	Spec     core.HealthCheck // type http or tcp, defaults applied, valid
 	Backends []*core.Backend
-	Observer core.Observer
+	Observer core.Observer // required
 }
 
 // Checker probes every backend on its own goroutine and flips the backend's
@@ -56,9 +56,6 @@ func StartChecker(cfg CheckerConfig) *Checker {
 		spec:     cfg.Spec,
 		observer: cfg.Observer,
 		dialer:   net.Dialer{Timeout: cfg.Spec.Timeout},
-	}
-	if c.observer == nil {
-		c.observer = func(core.Event) {}
 	}
 	// A pool is built at configuration time and outlives every request, so
 	// there is no caller context to inherit; the checker owns this one and

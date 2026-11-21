@@ -48,6 +48,18 @@ func (l *eventLog) count(kind core.EventKind, b *core.Backend) int {
 	return n
 }
 
+func ejected(backends []*core.Backend, now int64) int {
+	n := 0
+	for _, b := range backends {
+		if b.Ejected(now) {
+			n++
+		}
+	}
+	return n
+}
+
+func discard(core.Event) {}
+
 func testBackends(n int) []*core.Backend {
 	backends := make([]*core.Backend, n)
 	for i := range backends {
@@ -162,26 +174,44 @@ func TestOutlierMaxEjectedPercent(t *testing.T) {
 		name     string
 		backends int
 		percent  int
-		want     int // backends ejected when all of them fail
+		// unhealthy is how many backends the active check has marked down
+		// before the failures start.
+		unhealthy int
+		want      int // backends ejected when all the healthy ones fail
 	}{
 		{name: "half of four", backends: 4, percent: 50, want: 2},
 		{name: "rounds down", backends: 3, percent: 50, want: 1},
 		{name: "single backend is never ejected", backends: 1, percent: 50, want: 0},
 		{name: "zero percent disables ejection", backends: 4, percent: 0, want: 0},
-		{name: "all", backends: 3, percent: 100, want: 3},
+		{name: "everything but the last available backend", backends: 3, percent: 100, want: 2},
+		{name: "unhealthy backends use up the limit", backends: 4, percent: 50, unhealthy: 2, want: 0},
+		{name: "one unhealthy leaves room for one ejection", backends: 4, percent: 50, unhealthy: 1, want: 1},
+		{name: "last available backend is kept at 100 percent", backends: 4, percent: 100, unhealthy: 3, want: 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := defaultOutlier()
 			spec.MaxEjectedPercent = tc.percent
 			f := newOutlierFixture(tc.backends, spec)
+			for _, b := range f.backends[:tc.unhealthy] {
+				b.SetHealthy(false)
+			}
 			for range 5 {
-				for _, b := range f.backends {
+				for _, b := range f.backends[tc.unhealthy:] {
 					f.fail(b, 3)
 				}
 			}
-			if got := f.detector.ejected(f.clock.now()); got != tc.want {
+			if got := ejected(f.backends, f.clock.now()); got != tc.want {
 				t.Errorf("got %d ejected, want %d", got, tc.want)
+			}
+			available := 0
+			for _, b := range f.backends {
+				if b.Available(f.clock.now()) {
+					available++
+				}
+			}
+			if tc.backends > tc.unhealthy && available == 0 {
+				t.Error("ejection left no backend available")
 			}
 			if got := len(f.events.snapshot()); got != tc.want {
 				t.Errorf("got %d ejection events, want %d", got, tc.want)
@@ -313,9 +343,8 @@ func TestOutlierConcurrentRecordRespectsLimit(t *testing.T) {
 	}
 	wg.Wait()
 
-	ejected := detector.ejected(time.Now().UnixNano())
-	if ejected != 2 {
-		t.Errorf("got %d ejected of 8 under sustained failures, want exactly the 25%% limit of 2", ejected)
+	if got := ejected(backends, core.Now()); got != 2 {
+		t.Errorf("got %d ejected of 8 under sustained failures, want exactly the 25%% limit of 2", got)
 	}
 	if got := ejections.Load(); got != 2 {
 		t.Errorf("got %d ejection events, want 2", got)
@@ -336,7 +365,7 @@ func TestOutlierRecordDoesNotAllocate(t *testing.T) {
 
 func BenchmarkOutlierRecordSuccess(b *testing.B) {
 	backends := testBackends(16)
-	detector := NewOutlier(OutlierConfig{Pool: "app", Spec: defaultOutlier(), Backends: backends})
+	detector := NewOutlier(OutlierConfig{Pool: "app", Spec: defaultOutlier(), Backends: backends, Observer: discard})
 	b.ReportAllocs()
 	i := 0
 	for b.Loop() {
@@ -347,7 +376,7 @@ func BenchmarkOutlierRecordSuccess(b *testing.B) {
 
 func BenchmarkOutlierRecordSuccessParallel(b *testing.B) {
 	backends := testBackends(16)
-	detector := NewOutlier(OutlierConfig{Pool: "app", Spec: defaultOutlier(), Backends: backends})
+	detector := NewOutlier(OutlierConfig{Pool: "app", Spec: defaultOutlier(), Backends: backends, Observer: discard})
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
@@ -360,7 +389,7 @@ func BenchmarkOutlierRecordSuccessParallel(b *testing.B) {
 
 func BenchmarkOutlierRecordMixed(b *testing.B) {
 	backends := testBackends(16)
-	detector := NewOutlier(OutlierConfig{Pool: "app", Spec: defaultOutlier(), Backends: backends})
+	detector := NewOutlier(OutlierConfig{Pool: "app", Spec: defaultOutlier(), Backends: backends, Observer: discard})
 	b.ReportAllocs()
 	i := 0
 	for b.Loop() {

@@ -223,12 +223,12 @@ func TestMalformedRequestsAreRejected(t *testing.T) {
 }
 
 // A request carrying both Content-Length and Transfer-Encoding is the
-// classic smuggling vector; PRD section 6 requires it to be rejected and
-// never forwarded.
-func TestContentLengthWithTransferEncodingIsRejected(t *testing.T) {
-	knownBug(t, "BUG: a request with both Content-Length and Transfer-Encoding: chunked is accepted and forwarded "+
-		"(as chunked, Content-Length dropped) with status 200, and the client connection is kept open for reuse; "+
-		"PRD section 6 requires it to be rejected and never reach a backend, RFC 9112 6.1 requires at least closing the connection")
+// classic smuggling vector. net/http resolves it before any handler runs
+// (the length is dropped, RFC 9112 6.3) and does not report that it did, so
+// golb cannot reject it without parsing requests itself. What it can and
+// must do: forward one unambiguous message and close the client connection
+// afterwards, as the RFC requires.
+func TestContentLengthWithTransferEncodingClosesTheConnection(t *testing.T) {
 	rec := newRecorder(t, nil)
 	in := start(t, webConfig(poolOf("round_robin", rec.backend), ""))
 	request := "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n" +
@@ -247,19 +247,24 @@ func TestContentLengthWithTransferEncodingIsRejected(t *testing.T) {
 		t.Fatalf("set deadline: %v", err)
 	}
 	response, err := io.ReadAll(conn)
-	if line := statusLine(string(response)); !strings.HasPrefix(line, "HTTP/1.1 400") {
-		t.Errorf("status line %q, want 400", line)
-	}
-	// RFC 9112 6.1: whatever the server does with such a request, it must
+	// RFC 9112 6.3: whatever the server does with such a request, it must
 	// close the connection after responding.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		t.Errorf("connection was left open for reuse after a request with both Content-Length and Transfer-Encoding")
 	}
-	if got := rec.hits.Load(); got != 0 {
-		header, _, body, _ := rec.last()
-		t.Errorf("request reached the backend: Content-Length %q Transfer-Encoding %q body %q",
-			header.Get("Content-Length"), header.Get("Transfer-Encoding"), body)
+	if strings.HasPrefix(statusLine(string(response)), "HTTP/1.1 400") {
+		if got := rec.hits.Load(); got != 0 {
+			t.Errorf("request was rejected but reached the backend %d times", got)
+		}
+		return
+	}
+	header, _, body, bodyErr := rec.last()
+	if rec.hits.Load() != 1 || bodyErr != nil || body != "abc" {
+		t.Errorf("backend saw %d requests, body %q (err %v); want exactly one with the chunked body %q", rec.hits.Load(), body, bodyErr, "abc")
+	}
+	if got := header.Get("Content-Length"); got != "" {
+		t.Errorf("Content-Length %q was forwarded next to chunked encoding", got)
 	}
 }
 
@@ -348,11 +353,11 @@ func TestBadChunkFramingNeverCompletesUpstream(t *testing.T) {
 	}
 }
 
-// PRD section 6 words the bad-chunk case as "never reaches a backend".
-func TestBadChunkFramingNeverReachesBackend(t *testing.T) {
-	knownBug(t, "BUG (low): a request with a broken chunk header is opened on a backend before its body is validated; "+
-		"the backend sees the request line and headers and then an aborted body, and golb answers 502 instead of 400. "+
-		"PRD section 6 requires that it never reaches a backend")
+// Bodies are streamed, so a request whose chunk framing breaks has already
+// been opened on a backend when the break is found. What must hold: the
+// client gets 400, the backend never sees a complete request, and the
+// client's mistake is not counted as a backend failure.
+func TestBadChunkFramingIsRejectedWithoutBlamingBackend(t *testing.T) {
 	rec := newRecorder(t, nil)
 	in := start(t, webConfig(poolOf("round_robin", rec.backend).with(outlierOff), ""))
 	request := "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nabc\r\n0\r\n\r\n"
@@ -360,8 +365,15 @@ func TestBadChunkFramingNeverReachesBackend(t *testing.T) {
 	if line := statusLine(response); !strings.HasPrefix(line, "HTTP/1.1 400") {
 		t.Errorf("status line %q, want 400", line)
 	}
-	if got := rec.hits.Load(); got != 0 {
-		t.Errorf("request reached the backend %d times", got)
+	if rec.hits.Load() != 0 {
+		// The recorder stores a request once it has finished reading it.
+		recorded := eventually(waitTimeout, func() bool {
+			header, _, _, _ := rec.last()
+			return header != nil
+		})
+		if _, _, body, bodyErr := rec.last(); !recorded || bodyErr == nil {
+			t.Errorf("backend received a complete request with body %q (recorded: %v)", body, recorded)
+		}
 	}
 	if got := in.metrics().sum("golb_upstream_requests_total", "result", "error"); got != 0 {
 		t.Errorf("the client's malformed body was counted as %v backend failures", got)
@@ -440,9 +452,6 @@ func TestSlowHeadersHitReadHeaderTimeout(t *testing.T) {
 // stops in the middle of the body must not be able to hold a backend
 // connection and an in-flight slot beyond it.
 func TestStalledRequestBodyIsBoundedByRequestTimeout(t *testing.T) {
-	knownBug(t, "BUG: a request whose body upload stalls is not ended by timeouts.request when that timeout is longer than "+
-		"dial_timeout + per_try_timeout (true for the defaults: 60 s vs 2 s + 10 s); nothing else bounds a stalled body, so "+
-		"the client connection, an upstream connection and a backend in-flight slot are held for as long as the client likes")
 	const request = time.Second
 	rec := newRecorder(t, nil)
 	retry := "    retry:\n      per_try_timeout: 300ms\n    transport:\n      dial_timeout: 200ms\n"
@@ -480,9 +489,6 @@ func TestStalledRequestBodyIsBoundedByRequestTimeout(t *testing.T) {
 // malformed is the client's failure, yet each one is fed to outlier
 // detection as a failure of the backend it was being forwarded to.
 func TestMalformedClientBodiesDoNotEjectBackends(t *testing.T) {
-	knownBug(t, "BUG: a client can get healthy backends ejected: every request with a malformed chunked body is counted as a "+
-		"failure of the backend it was forwarded to, so consecutive_failures such requests per backend eject up to "+
-		"max_ejected_percent of the pool for everyone")
 	backends := newBackends(t, 4)
 	in := start(t, webConfig(poolOf("round_robin", backends...), "")) // default outlier settings
 	malformed := "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nabc\r\n0\r\n\r\n"

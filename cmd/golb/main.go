@@ -52,6 +52,9 @@ func run(ctx context.Context, args []string, signals <-chan os.Signal, stdout, s
 	}
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+	// Packages that log through the slog default (health checking does)
+	// then write the same format to the same place.
+	slog.SetDefault(logger)
 	srv, err := server.New(ctx, server.Options{ConfigPath: *path, Logger: logger, AccessLog: stdout})
 	if err != nil {
 		logger.Error("start", "config", *path, "error", err)

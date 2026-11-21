@@ -144,6 +144,95 @@ x 2
 	}
 }
 
+func TestDelete(t *testing.T) {
+	r := NewRegistry()
+	kept := r.Counter("req_total", "h", "pool", "a", "backend", "x")
+	kept.Add(3)
+	gone := r.Counter("req_total", "h", "pool", "a", "backend", "y")
+	gone.Add(5)
+	r.GaugeFunc("healthy", "h", func() float64 { return 1 }, "backend", "y")
+	r.Histogram("dur_seconds", "h", []float64{1}, "pool", "a").Observe(0.5)
+	r.Gauge("plain", "h").Set(2)
+
+	r.Delete("req_total", "backend", "y", "pool", "a") // label order differs from registration
+	r.Delete("healthy", "backend", "y")
+	r.Delete("dur_seconds", "pool", "a")
+	r.Delete("plain")
+	r.Delete("req_total", "pool", "a", "backend", "never-registered")
+	r.Delete("no_such_metric", "k", "v")
+	r.Delete("req_total", "pool")
+
+	want := "# HELP req_total h\n# TYPE req_total counter\nreq_total{pool=\"a\",backend=\"x\"} 3\n"
+	if got := render(t, r); got != want {
+		t.Errorf("after deletes:\n got:\n%s\nwant:\n%s", got, want)
+	}
+
+	gone.Inc()
+	if gone.Value() != 6 {
+		t.Errorf("deleted handle stopped counting: got %d, want 6", gone.Value())
+	}
+	again := r.Counter("req_total", "h", "pool", "a", "backend", "y")
+	if again == gone || again.Value() != 0 {
+		t.Errorf("re-registering a deleted series returned the old one (value %d), want a fresh counter", again.Value())
+	}
+	// A family emptied by Delete may come back with another type.
+	r.Gauge("healthy", "h").Set(7)
+	if !strings.Contains(render(t, r), "# TYPE healthy gauge\nhealthy 7\n") {
+		t.Errorf("emptied family could not be registered again:\n%s", render(t, r))
+	}
+}
+
+func TestLabelOrderIsNotPartOfTheSeries(t *testing.T) {
+	r := NewRegistry()
+	c := r.Counter("c_total", "h", "listener", "web", "route", "/", "code_class", "2xx")
+	if r.Counter("c_total", "h", "code_class", "2xx", "route", "/", "listener", "web") != c {
+		t.Error("the same labels in another order produced a second series")
+	}
+	c.Inc()
+	want := "# HELP c_total h\n# TYPE c_total counter\nc_total{listener=\"web\",route=\"/\",code_class=\"2xx\"} 1\n"
+	if got := render(t, r); got != want {
+		t.Errorf("got %q, want one series in the order of the first registration %q", got, want)
+	}
+}
+
+func TestDeleteDuringScrape(t *testing.T) {
+	r := NewRegistry()
+	names := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Go(func() {
+			for j := range 300 {
+				name := names[(i+j)%len(names)]
+				r.Counter("churn_total", "h", "k", name).Inc()
+				r.GaugeFunc("churn_fn", "h", func() float64 { return 1 }, "k", name)
+				r.Delete("churn_total", "k", name)
+				r.Delete("churn_fn", "k", name)
+			}
+		})
+	}
+	for range 4 {
+		wg.Go(func() {
+			for range 300 {
+				var buf bytes.Buffer
+				if _, err := r.WriteTo(&buf); err != nil {
+					t.Errorf("write metrics: %v", err)
+					return
+				}
+				for line := range strings.SplitSeq(buf.String(), "\n") {
+					if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "churn_") {
+						t.Errorf("corrupt line during concurrent delete: %q", line)
+						return
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if got := render(t, r); got != "" {
+		t.Errorf("series left after every one was deleted:\n%s", got)
+	}
+}
+
 func TestGaugeFuncReplaced(t *testing.T) {
 	r := NewRegistry()
 	r.GaugeFunc("up", "h", func() float64 { return 1 }, "pool", "a")

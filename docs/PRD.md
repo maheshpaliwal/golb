@@ -581,7 +581,8 @@ type Certificate struct {
 type Timeouts struct {
 	ReadHeader     time.Duration `yaml:"read_header"`      // default 5s
 	Idle           time.Duration `yaml:"idle"`             // default 60s
-	Request        time.Duration `yaml:"request"`          // whole request incl. retries, default 60s; 0 = none
+	Request        time.Duration `yaml:"request"`          // wait for response headers incl. retries, upload time excluded, default 60s; 0 = none
+	BodyIdle       time.Duration `yaml:"body_idle"`        // longest a body or upgraded connection may make no progress, default 60s; 0 = none
 	MaxHeaderBytes int           `yaml:"max_header_bytes"` // default 65536
 }
 
@@ -687,7 +688,7 @@ All listeners in tests bind `127.0.0.1:0`. Backends are in-process (`httptest.Se
 **Integration** (`test/`):
 - HTTP/1.1 and HTTP/2 (TLS) round trip; large and chunked bodies both directions; trailers; streaming response flushes promptly; WebSocket echo through the proxy; TCP echo and half-close.
 - Headers: hop-by-hop headers and headers named in `Connection` are removed; client-supplied `X-Forwarded-For` does not survive unmodified; `Host` policy.
-- Malformed input: both `Content-Length` and `Transfer-Encoding`, duplicate `Content-Length`, oversized headers, bad chunk framing. Each is rejected by golb and never reaches a backend.
+- Malformed input: duplicate `Content-Length`, oversized headers: rejected by golb and never reaches a backend. Bad chunk framing: answered 400, the backend never receives a complete request and is not charged with a failure (bodies are streamed, so the request has been opened on a backend when the break is found). Both `Content-Length` and `Transfer-Encoding`: `net/http` drops the length before any handler runs and does not report it, so golb cannot reject the request without its own parser (section 4.1); it forwards one unambiguous chunked message and closes the client connection after the response, as RFC 9112 6.3 requires. Because the case cannot be told apart, every chunked HTTP/1 request closes its connection.
 - SNI picks the right certificate; TLS 1.1 refused.
 
 **Failure injection**:

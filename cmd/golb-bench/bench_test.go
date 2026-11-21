@@ -296,6 +296,48 @@ func TestLoadFixedRateGivesUpOnHopelessBacklog(t *testing.T) {
 	if run.Errors < 250 || run.FirstErr != errBehindSchedule.Error() {
 		t.Errorf("errors=%d first=%q, want most of the schedule failed as behind schedule", run.Errors, run.FirstErr)
 	}
+	// More than 80% of the schedule failed after waiting out the timeout,
+	// so every upper percentile must show at least the timeout.
+	if run.P50 < 100_000 || run.P99 < 100_000 || run.P999 < 100_000 {
+		t.Errorf("p50=%vµs p99=%vµs p99.9=%vµs, want all at or above the 100ms timeout: failed requests belong in the latency figures", run.P50, run.P99, run.P999)
+	}
+	if rep.Rate != 1000 || run.ReqPerSec > 100 {
+		t.Errorf("offered %v req/s, achieved %v ok req/s; the achieved rate must not echo the offered one", rep.Rate, run.ReqPerSec)
+	}
+}
+
+// Requests that time out must appear in the percentiles at the time they
+// waited, not vanish from them.
+func TestLoadTimeoutsCountInLatency(t *testing.T) {
+	addr := startEcho(t, 1, echoConfig{size: 1, delay: time.Second})[0]
+	rep := load(t, "-url", "http://"+addr+"/", "-c", "2", "-d", "200ms", "-warmup", "0", "-timeout", "50ms")
+	run := rep.Median
+	if run.Requests == 0 || run.Errors != run.Requests {
+		t.Fatalf("requests=%d errors=%d, want every request to time out", run.Requests, run.Errors)
+	}
+	if run.P50 < 50_000 || run.Max < 50_000 {
+		t.Errorf("p50=%vµs max=%vµs, want at least the 50ms each request waited", run.P50, run.Max)
+	}
+	if run.ReqPerSec != 0 {
+		t.Errorf("ok req/s %v, want 0", run.ReqPerSec)
+	}
+}
+
+// Fixed-rate latency runs from the intended send time even when the worker
+// was idle, so it can never be below the service time.
+func TestLoadFixedRateMeasuresFromIntendedSend(t *testing.T) {
+	addr := startEcho(t, 1, echoConfig{size: 1, delay: 20 * time.Millisecond})[0]
+	rep := load(t, "-url", "http://"+addr+"/", "-c", "4", "-rate", "40", "-d", "400ms", "-warmup", "0")
+	run := rep.Median
+	if run.Requests < 14 || run.Requests > 18 || run.Errors != 0 {
+		t.Fatalf("requests=%d errors=%d (%s), want the 16 scheduled", run.Requests, run.Errors, run.FirstErr)
+	}
+	if run.P50 < 20_000 {
+		t.Errorf("p50 %vµs is below the 20ms service time", run.P50)
+	}
+	if math.Abs(run.ReqPerSec-float64(run.Requests)/0.4) > 0.01 {
+		t.Errorf("ok req/s %v does not match %d answered requests in 400ms", run.ReqPerSec, run.Requests)
+	}
 }
 
 func TestLoadCountsErrors(t *testing.T) {
@@ -310,6 +352,9 @@ func TestLoadCountsErrors(t *testing.T) {
 			check: func(t *testing.T, run runStats) {
 				if run.Errors != 0 || run.Status[5] != run.Requests || run.nonSuccess() != run.Requests {
 					t.Errorf("errors=%d 5xx=%d of %d, want every response counted as 5xx", run.Errors, run.Status[5], run.Requests)
+				}
+				if run.ReqPerSec != 0 || run.ResponsesPerSec <= 0 {
+					t.Errorf("ok/s=%v responses/s=%v, want fast 5xx answers counted as responses but not as successful throughput", run.ReqPerSec, run.ResponsesPerSec)
 				}
 			},
 		},
@@ -328,8 +373,11 @@ func TestLoadCountsErrors(t *testing.T) {
 				if run.Errors == 0 || run.Errors != run.Requests || run.FirstErr == "" {
 					t.Errorf("errors=%d of %d first=%q, want every request an error with a message", run.Errors, run.Requests, run.FirstErr)
 				}
-				if run.ReqPerSec != 0 {
-					t.Errorf("req/s %v counts failed requests", run.ReqPerSec)
+				if run.ReqPerSec != 0 || run.ResponsesPerSec != 0 {
+					t.Errorf("ok/s=%v responses/s=%v count failed requests", run.ReqPerSec, run.ResponsesPerSec)
+				}
+				if run.P50 <= 0 {
+					t.Error("failed requests are missing from the latency figures")
 				}
 			},
 		},
@@ -421,10 +469,11 @@ func TestLoadOutputFormats(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{name: "text", args: []string{"-label", "golb"}, want: []string{"label        golb", "mode         closed-loop, 2 connections", "req/s", "p99.9=", "status     2xx="}},
+		{name: "text", args: []string{"-label", "golb"}, want: []string{"label        golb", "mode         closed-loop, 2 connections", "ok req/s", "responses", "p99.9=", "status     2xx="}},
 		{name: "text with several runs", args: []string{"-runs", "2"}, want: []string{"run 1", "run 2", "median run"}},
 		{name: "markdown row", args: []string{"-format", "markdown", "-label", "golb"}, want: []string{"| golb | "}},
-		{name: "markdown with header", args: []string{"-format", "markdown", "-header"}, want: []string{"| scenario | req/s (median) |", "|---|"}},
+		{name: "markdown with header", args: []string{"-format", "markdown", "-header"}, want: []string{"| scenario | offered req/s | ok req/s (median) |", "|---|", "| closed loop |"}},
+		{name: "markdown fixed rate shows the offered rate", args: []string{"-format", "markdown", "-rate", "100", "-label", "golb"}, want: []string{"| golb | 100 | "}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

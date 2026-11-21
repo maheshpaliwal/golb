@@ -18,7 +18,8 @@ listeners:
     timeouts:
       read_header: 5s
       idle: 60s
-      request: 60s            # wait for an upstream response, all tries; 0 = none
+      request: 60s            # wait for response headers from the pool, all tries; 0 = none
+      body_idle: 60s          # longest a body or upgraded connection may stay silent; 0 = none
       max_header_bytes: 65536
     routes:
       - path_prefix: /

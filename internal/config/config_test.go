@@ -51,6 +51,7 @@ func TestParseAppliesDefaults(t *testing.T) {
 		{name: "read header", got: listener.Timeouts.ReadHeader, want: 5 * time.Second},
 		{name: "idle", got: listener.Timeouts.Idle, want: 60 * time.Second},
 		{name: "request", got: listener.Timeouts.Request, want: 60 * time.Second},
+		{name: "body idle", got: listener.Timeouts.BodyIdle, want: 60 * time.Second},
 		{name: "max header bytes", got: listener.Timeouts.MaxHeaderBytes, want: 65536},
 		{name: "path prefix", got: listener.Routes[0].PathPrefix, want: "/"},
 		{name: "policy", got: pool.Policy, want: core.P2CEWMA},
@@ -84,6 +85,7 @@ listeners:
     protocol: http
     timeouts:
       request: 0s
+      body_idle: 0s
       idle: 90s
     routes:
       - pool: app
@@ -105,6 +107,9 @@ pools:
 	}
 	if got := cfg.Listeners[0].Timeouts.Request; got != 0 {
 		t.Errorf("request timeout = %v, want explicit 0", got)
+	}
+	if got := cfg.Listeners[0].Timeouts.BodyIdle; got != 0 {
+		t.Errorf("body_idle = %v, want explicit 0", got)
 	}
 	if got := cfg.Listeners[0].Timeouts.Idle; got != 90*time.Second {
 		t.Errorf("idle = %v, want 90s", got)
@@ -221,6 +226,36 @@ func TestParseRejects(t *testing.T) {
 			want:  []string{"route 0", "rate_limit needs"},
 		},
 		{
+			name:  "rate limit that is not a number",
+			input: base("- pool: app", "- pool: app\n        rate_limit:\n          requests_per_second: .nan\n          burst: 1"),
+			want:  []string{"route 0", "rate_limit needs"},
+		},
+		{
+			name:  "infinite rate limit",
+			input: base("- pool: app", "- pool: app\n        rate_limit:\n          requests_per_second: .inf\n          burst: 1"),
+			want:  []string{"route 0", "rate_limit needs"},
+		},
+		{
+			name:  "sample rate that is not a number",
+			input: minimal + "access_log:\n  sample_rate: .nan\n",
+			want:  []string{"access_log: sample_rate"},
+		},
+		{
+			name:  "prefixes differing only by a trailing slash",
+			input: base("- pool: app", "- pool: app\n        path_prefix: /api\n      - pool: app\n        path_prefix: /api/"),
+			want:  []string{"route 1", "duplicate host and path_prefix"},
+		},
+		{
+			name:  "route host with a trailing dot",
+			input: base("- pool: app", "- pool: app\n        host: example.test."),
+			want:  []string{"route 0", "trailing dot"},
+		},
+		{
+			name:  "negative body idle",
+			input: base("protocol: http", "protocol: http\n    timeouts:\n      body_idle: -1s"),
+			want:  []string{`listener "web"`, "body_idle >= 0"},
+		},
+		{
 			name:  "http listener without routes",
 			input: base("    routes:\n      - pool: app\n", ""),
 			want:  []string{`listener "web"`, "no routes"},
@@ -327,6 +362,11 @@ func TestParseAccepts(t *testing.T) {
 		{name: "admin non-loopback when allowed", input: minimal + "admin:\n  addr: 192.0.2.10:9901\n  allow_non_loopback: true\n"},
 		{name: "wildcard route host", input: strings.Replace(minimal, "- pool: app", "- pool: app\n        host: \"*.example.test\"", 1)},
 		{name: "ring hash with header", input: minimal + "    policy: ring_hash\n    hash_header: X-User\n"},
+		{
+			name: "several listeners on port 0",
+			input: strings.Replace(minimal, "addr: 127.0.0.1:8080", "addr: 127.0.0.1:0", 1) +
+				"admin:\n  addr: 127.0.0.1:0\n",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

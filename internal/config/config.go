@@ -35,6 +35,7 @@ const (
 	defaultReadHeader      = 5 * time.Second
 	defaultIdle            = 60 * time.Second
 	defaultRequest         = 60 * time.Second
+	defaultBodyIdle        = 60 * time.Second
 	defaultMaxHeaderBytes  = 64 << 10
 	defaultPathPrefix      = "/"
 	defaultMaxAttempts     = 3
@@ -108,10 +109,12 @@ type Timeouts struct {
 	ReadHeader     time.Duration `yaml:"read_header"`
 	Idle           time.Duration `yaml:"idle"`
 	Request        time.Duration `yaml:"request"`
+	BodyIdle       time.Duration `yaml:"body_idle"`
 	MaxHeaderBytes int           `yaml:"max_header_bytes"`
 
-	// requestSet distinguishes "request: 0" (no limit) from an omitted key.
-	requestSet bool
+	// The set flags distinguish an explicit 0 (no limit) from an omitted key.
+	requestSet  bool
+	bodyIdleSet bool
 }
 
 type Route struct {
@@ -160,7 +163,8 @@ func (a *AccessLog) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// UnmarshalYAML records whether request was written, so 0 can mean "no limit".
+// UnmarshalYAML records whether request and body_idle were written, so 0 can
+// mean "no limit".
 func (t *Timeouts) UnmarshalYAML(node *yaml.Node) error {
 	type plain Timeouts
 	err := decodeKnown(node, (*plain)(t))
@@ -168,6 +172,7 @@ func (t *Timeouts) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	t.requestSet = hasKey(node, "request")
+	t.bodyIdleSet = hasKey(node, "body_idle")
 	return nil
 }
 
@@ -269,6 +274,9 @@ func (l *Listener) applyDefaults() {
 	l.Timeouts.MaxHeaderBytes = orDefault(l.Timeouts.MaxHeaderBytes, defaultMaxHeaderBytes)
 	if !l.Timeouts.requestSet {
 		l.Timeouts.Request = defaultRequest
+	}
+	if !l.Timeouts.bodyIdleSet {
+		l.Timeouts.BodyIdle = defaultBodyIdle
 	}
 	if l.TLS != nil {
 		l.TLS.MinVersion = orDefault(l.TLS.MinVersion, TLS12)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -143,21 +144,84 @@ func TestRoundRobinScheduleIsSmooth(t *testing.T) {
 	}
 }
 
-func TestRoundRobinKeepsWeightsWhenSkipping(t *testing.T) {
-	backends := newBackends(1, 2, 3, 6)
-	backends[2].SetHealthy(false)
+// An unavailable backend's share must be spread over the others in the
+// ratio of their weights, not handed to its neighbour in schedule order.
+func TestUnavailableShareIsSpreadByWeight(t *testing.T) {
+	tests := []struct {
+		name    string
+		weights []uint32
+		down    []int
+	}{
+		{name: "one of four equal", weights: []uint32{1, 1, 1, 1}, down: []int{1}},
+		{name: "two adjacent of five equal", weights: equalWeights(5), down: []int{1, 2}},
+		{name: "heavy backend down", weights: []uint32{3, 1, 1, 1}, down: []int{0}},
+		{name: "light backend down", weights: []uint32{1, 2, 3, 6}, down: []int{2}},
+		{name: "only the lightest left with one other", weights: []uint32{256, 1, 2}, down: []int{0}},
+	}
+	for _, policy := range []core.Policy{core.RoundRobin, core.LeastConn} {
+		for _, tc := range tests {
+			t.Run(string(policy)+"/"+tc.name, func(t *testing.T) {
+				backends := newBackends(tc.weights...)
+				var live []*core.Backend
+				for i, b := range backends {
+					if slices.Contains(tc.down, i) {
+						b.SetHealthy(false)
+						continue
+					}
+					live = append(live, b)
+				}
+				bal := mustNew(t, policy, backends)
+				counts := make(map[*core.Backend]int)
+				for range picks {
+					b := bal.Pick(core.PickInfo{})
+					b.Acquire()
+					counts[b]++
+					b.Release()
+				}
+				for _, i := range tc.down {
+					if counts[backends[i]] != 0 {
+						t.Fatalf("unhealthy backend %d got %d picks", i, counts[backends[i]])
+					}
+				}
+				assertShares(t, live, counts, 0.01)
+			})
+		}
+	}
+}
+
+// With two backends, one failing but not yet ejected, a retry must not
+// consume the slot that would have sent the next request to the good one.
+func TestRoundRobinRetryDoesNotSkewFirstAttempts(t *testing.T) {
+	backends := newBackends(1, 1)
+	failing := backends[0]
 	bal := mustNew(t, core.RoundRobin, backends)
+	first := make(map[*core.Backend]int)
+	for range 1000 {
+		b := bal.Pick(core.PickInfo{})
+		first[b]++
+		if b != failing {
+			continue
+		}
+		if retry := bal.Pick(core.PickInfo{Exclude: []*core.Backend{b}}); retry != backends[1] {
+			t.Fatalf("retry went to %v, want the other backend", retry)
+		}
+	}
+	if first[failing] != 500 || first[backends[1]] != 500 {
+		t.Errorf("first attempts: %d to the failing backend, %d to the good one; want 500 each", first[failing], first[backends[1]])
+	}
+}
+
+func TestLeastConnIdlePoolHonoursWeights(t *testing.T) {
+	backends := newBackends(1, 10)
+	bal := mustNew(t, core.LeastConn, backends)
 	counts := make(map[*core.Backend]int)
 	for range picks {
-		counts[bal.Pick(core.PickInfo{})]++
+		b := bal.Pick(core.PickInfo{})
+		b.Acquire()
+		counts[b]++
+		b.Release()
 	}
-	if counts[backends[2]] != 0 {
-		t.Fatalf("unhealthy backend got %d picks", counts[backends[2]])
-	}
-	live := []*core.Backend{backends[0], backends[1], backends[3]}
-	// Slots of the skipped backend go to its schedule neighbours, so the
-	// remaining ratio is close to the weights but not exact.
-	assertShares(t, live, counts, 0.35)
+	assertShares(t, backends, counts, 0.01)
 }
 
 // Holding every picked slot makes load visible to the policy, which is what
@@ -270,16 +334,6 @@ func TestP2CPrefersLowerCost(t *testing.T) {
 			},
 			wantMost: 3, wantLeast: 0,
 		},
-		{
-			name: "backend without a latency sample is probed first",
-			setup: func(backends []*core.Backend) {
-				for _, b := range backends[:3] {
-					b.ObserveLatency(time.Millisecond)
-				}
-				backends[0].ObserveLatency(50 * time.Millisecond)
-			},
-			wantMost: 3, wantLeast: 0,
-		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -325,6 +379,122 @@ func TestP2CSingleSlowBackendGetsLessTraffic(t *testing.T) {
 	}
 }
 
+// A backend with no latency sample must get a fair share: enough to be
+// measured, not the half of all traffic that "unknown means fastest" gave it.
+func TestP2CUnsampledBackendGetsFairShare(t *testing.T) {
+	tests := []struct {
+		name      string
+		unsampled []int
+	}{
+		{name: "one new backend", unsampled: []int{3}},
+		{name: "two new backends", unsampled: []int{0, 2}},
+		{name: "all new", unsampled: []int{0, 1, 2, 3}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backends := newBackends(equalWeights(4)...)
+			for i, b := range backends {
+				if !slices.Contains(tc.unsampled, i) {
+					b.ObserveLatency(time.Millisecond)
+				}
+			}
+			bal := mustNew(t, core.P2CEWMA, backends)
+			counts := make(map[*core.Backend]int)
+			for range picks {
+				counts[bal.Pick(core.PickInfo{})]++
+			}
+			assertShares(t, backends, counts, 0.05)
+		})
+	}
+}
+
+// The fallback scan must not hand everything to an unsampled backend either.
+func TestP2CFallbackScanCostsUnsampledAtTheMean(t *testing.T) {
+	backends := newBackends(equalWeights(6)...)
+	for _, b := range backends[:4] {
+		b.SetHealthy(false)
+	}
+	sampled, unsampled := backends[4], backends[5]
+	sampled.ObserveLatency(time.Millisecond)
+	bal := mustNew(t, core.P2CEWMA, backends)
+	counts := make(map[*core.Backend]int)
+	for range picks {
+		counts[bal.Pick(core.PickInfo{})]++
+	}
+	assertShares(t, []*core.Backend{sampled, unsampled}, counts, 0.05)
+}
+
+// One slow response must not exclude a backend for good: once its average
+// has had no sample for a second it is probed, and the probe's sample
+// replaces the stale average.
+func TestP2CRecoversAfterLatencySpike(t *testing.T) {
+	backends := newBackends(equalWeights(4)...)
+	spiked := backends[2]
+	for _, b := range backends {
+		b.ObserveLatency(time.Millisecond)
+	}
+	spiked.ObserveLatency(200 * time.Millisecond)
+	spiked.ObserveLatency(200 * time.Millisecond)
+	bal := mustNew(t, core.P2CEWMA, backends)
+
+	for range 10_000 {
+		if bal.Pick(core.PickInfo{}) == spiked {
+			t.Fatal("a backend sampled as slow a moment ago was picked; probes must wait for the average to go stale")
+		}
+	}
+
+	// The same spike, two seconds old.
+	stale := core.NewBackend(spiked.Addr, 1)
+	stale.ObserveLatencyAt(200*time.Millisecond, core.Now()-int64(2*time.Second))
+	backends[2] = stale
+	bal = mustNew(t, core.P2CEWMA, backends)
+	probes := 0
+	for range 10_000 {
+		if bal.Pick(core.PickInfo{}) == stale {
+			probes++
+		}
+	}
+	if probes != 1 {
+		t.Fatalf("got %d probes of a backend whose slow average went stale, want exactly 1 until its response is sampled", probes)
+	}
+	// The pool samples the probe's response; the backend is healthy again.
+	stale.ObserveLatency(time.Millisecond)
+	if stale.Latency() != time.Millisecond {
+		t.Fatalf("latency after the probe: got %v, want the stale average replaced by 1ms", stale.Latency())
+	}
+	counts := make(map[*core.Backend]int)
+	for range picks {
+		counts[bal.Pick(core.PickInfo{})]++
+	}
+	assertShares(t, backends, counts, 0.05)
+}
+
+// A backend that stays slow keeps being probed, but only about once a
+// second, so it does not show up in the tail.
+func TestP2CProbesOfSlowBackendAreRare(t *testing.T) {
+	backends := newBackends(equalWeights(2)...)
+	backends[0].ObserveLatency(time.Millisecond)
+	slow := backends[1]
+	slow.ObserveLatencyAt(200*time.Millisecond, core.Now()-int64(2*time.Second))
+	bal := mustNew(t, core.P2CEWMA, backends)
+	probes := 0
+	began := time.Now()
+	for range picks {
+		b := bal.Pick(core.PickInfo{})
+		backends[0].ObserveLatency(time.Millisecond)
+		if b == slow {
+			// The response is deliberately never sampled: probes must be
+			// limited even while one is still in flight.
+			probes++
+		}
+	}
+	// One probe at the start, then one for each second the loop ran.
+	allowed := 1 + int(time.Since(began)/time.Second) + 1
+	if probes < 1 || probes > allowed {
+		t.Errorf("slow backend was picked %d times in %d picks over %v, want between 1 and %d", probes, picks, time.Since(began), allowed)
+	}
+}
+
 func TestRingHashDistribution(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -358,7 +528,7 @@ func TestRingHashPointCount(t *testing.T) {
 	}{
 		{name: "unit weights", weights: []uint32{1, 1, 1}, want: 3 * virtualNodesPerUnit},
 		{name: "weights", weights: []uint32{1, 3}, want: 4 * virtualNodesPerUnit},
-		{name: "common factor removed", weights: []uint32{100, 200}, want: 3 * virtualNodesPerUnit},
+		{name: "common factor is kept", weights: []uint32{100, 200}, want: 300 * virtualNodesPerUnit},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -382,7 +552,7 @@ func TestRingHashSearchMatchesFullBinarySearch(t *testing.T) {
 	}{
 		{name: "one backend", weights: []uint32{1}},
 		{name: "ten backends", weights: equalWeights(10)},
-		{name: "point count is a power of two", weights: []uint32{128, 128, 256}},
+		{name: "heavy", weights: []uint32{128, 128, 256}},
 		{name: "weighted", weights: []uint32{1, 7, 3, 250}},
 	}
 	for _, tc := range tests {
@@ -495,6 +665,78 @@ func TestRingHashMinimalRemap(t *testing.T) {
 				t.Errorf("%.1f%% of keys moved, want about 10%%", share*100)
 			}
 		})
+	}
+}
+
+// Adding or reweighting one backend must move keys only to or from that
+// backend, whatever it does to the GCD of the weights.
+func TestRingHashChangeMovesOnlyKeysOfChangedBackend(t *testing.T) {
+	tests := []struct {
+		name   string
+		before []uint32
+		// after lists the new weights; index len(before) and up are added
+		// backends, a changed weight at an existing index is a reweight.
+		after     []uint32
+		changed   int
+		wantMoved float64 // expected share of keys that move
+	}{
+		{name: "weight 1 joins ten of weight 2", before: []uint32{2, 2, 2, 2, 2, 2, 2, 2, 2, 2}, after: []uint32{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1}, changed: 10, wantMoved: 1.0 / 21},
+		{name: "weight 3 joins weights 2 and 4", before: []uint32{2, 4}, after: []uint32{2, 4, 3}, changed: 2, wantMoved: 3.0 / 9},
+		{name: "weight grows from 2 to 3", before: []uint32{2, 2, 2, 2}, after: []uint32{2, 3, 2, 2}, changed: 1, wantMoved: 1.0 / 9},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := mustNew(t, core.RingHash, newBackends(tc.before...))
+			after := mustNew(t, core.RingHash, newBackends(tc.after...))
+			changed := fmt.Sprintf("127.0.0.1:%d", 9000+tc.changed)
+			moved := 0
+			for i := range picks {
+				info := core.PickInfo{Key: key(i)}
+				was, is := before.Pick(info).Addr, after.Pick(info).Addr
+				if was == is {
+					continue
+				}
+				moved++
+				if was != changed && is != changed {
+					t.Fatalf("key %d moved from %s to %s, neither of which changed", i, was, is)
+				}
+			}
+			if share := float64(moved) / picks; math.Abs(share-tc.wantMoved) > tc.wantMoved*0.5 {
+				t.Errorf("%.1f%% of keys moved, want about %.1f%%", share*100, tc.wantMoved*100)
+			}
+		})
+	}
+}
+
+func TestRingHashPointsAreCapped(t *testing.T) {
+	weights := make([]uint32, 1000)
+	for i := range weights {
+		weights[i] = uint32(i%core.MaxWeight + 1)
+	}
+	backends := newBackends(weights...)
+	began := time.Now()
+	ring := newRingHash(backends)
+	if elapsed := time.Since(began); elapsed > 2*time.Second {
+		t.Errorf("building the ring took %v", elapsed)
+	}
+	if len(ring.hashes) > maxRingPoints {
+		t.Fatalf("got %d points, want at most %d", len(ring.hashes), maxRingPoints)
+	}
+	perBackend := make([]int, len(backends))
+	for _, owner := range ring.owners {
+		perBackend[owner]++
+	}
+	perUnit := perBackend[0] / int(backends[0].Weight)
+	if perUnit < 1 {
+		t.Fatal("lightest backend has no points")
+	}
+	for i, b := range backends {
+		if perBackend[i] != int(b.Weight)*perUnit {
+			t.Fatalf("backend %d weight %d: got %d points, want %d (%d per weight unit for every backend)", i, b.Weight, perBackend[i], int(b.Weight)*perUnit, perUnit)
+		}
+	}
+	if got := pointsPerUnit(100); got != virtualNodesPerUnit {
+		t.Errorf("small pool: got %d points per unit, want the full %d", got, virtualNodesPerUnit)
 	}
 }
 

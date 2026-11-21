@@ -120,9 +120,16 @@ measure() {
     -format markdown -label "$label" "$@"
 }
 
-not_measured() { echo "| $1 | not measured ($2) | | | | | | | | |"; }
+not_measured() { echo "| $1 | not measured ($2) | | | | | | | | | |"; }
 
 median_rps() { sed -n 's/.*"median_rps":\([0-9.]*\).*/\1/p' "$1"; }
+
+# half_of FILE  prints half the median successful req/s saved in FILE, or
+# nothing when the file is missing or the rate would be zero.
+half_of() {
+  [ -s "$1" ] || return 0
+  median_rps "$1" | awk '{ rate = int($1 / 2); if (rate > 0) print rate }'
+}
 
 golb_config() {
   local policy=$1 access_log=$2
@@ -180,16 +187,23 @@ golb_scenario() {
   stop "$golb_pid"
 }
 
-# proxy_scenario LABEL NAME COMMAND...  for every proxy other than golb.
+# proxy_scenario LABEL NAME COMMAND... [-- load flags...]  for every proxy
+# other than golb.
 proxy_scenario() {
   local label=$1 name=$2
   shift 2
-  if ! start "$name" "$PROXY_PORT" "$@"; then
+  local command=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+    command+=("$1")
+    shift
+  done
+  [ $# -gt 0 ] && shift
+  if ! start "$name" "$PROXY_PORT" "${command[@]}"; then
     not_measured "$label" "$name did not start"
     return 0
   fi
   local pid=$LAST_PID
-  measure "$label" || not_measured "$label" "load generator failed"
+  measure "$label" "$@" || not_measured "$label" "load generator failed"
   stop "$pid"
 }
 
@@ -332,8 +346,8 @@ table_header() {
   echo
   echo "### $1"
   echo
-  echo "| scenario | req/s (median) | req/s (min - max) | errors | non-2xx | p50 | p90 | p99 | p99.9 | max |"
-  echo "|---|---|---|---|---|---|---|---|---|---|"
+  echo "| scenario | offered req/s | ok req/s (median) | ok req/s (min - max) | errors | non-2xx | p50 | p90 | p99 | p99.9 | max |"
+  echo "|---|---|---|---|---|---|---|---|---|---|---|"
 }
 
 # ---------------------------------------------------------------------------
@@ -360,6 +374,7 @@ echo "- machine: $(uname -sm), $(getconf _NPROCESSORS_ONLN) logical CPUs; load g
 echo "- $(go version), GOMAXPROCS unset"
 echo "- commit: $commit"
 echo "- $CONNS keep-alive connections, $BODY byte responses, $RUNS runs of $DURATION after $WARMUP warm-up; the median run by req/s is shown"
+echo "- \"ok req/s\" counts responses with a status below 400; latencies cover every request, failed ones included, and in fixed-rate rows run from the intended send time"
 echo "- latencies are bucketed with at most 0.8% rounding, upwards"
 echo "- command: \`CONNS=$CONNS DURATION=$DURATION WARMUP=$WARMUP RUNS=$RUNS BODY=$BODY scripts/bench.sh\`"
 
@@ -385,12 +400,9 @@ competitor caddy caddy run --config "$WORK/Caddyfile" --adapter caddyfile
 competitor traefik traefik --entrypoints.web.address="$PROXY" --providers.file.filename="$WORK/traefik-dynamic.yaml" --log.level=ERROR
 competitor envoy envoy -c "$WORK/envoy.yaml" -l error
 
-rate=
-if [ -s "$WORK/golb.json" ]; then
-  rate=$(median_rps "$WORK/golb.json" | awk '{printf "%d", $1 / 2}')
-fi
+rate=$(half_of "$WORK/golb.json")
 table_header "Latency at a fixed rate (50% of golb round_robin throughput)"
-if [ -z "$rate" ] || [ "$rate" -le 0 ]; then
+if [ -z "$rate" ]; then
   not_measured "fixed rate" "no golb round_robin throughput to derive the rate from"
 else
   echo "<!-- rate: $rate req/s. Overhead = golb row minus direct row. -->"
@@ -398,11 +410,23 @@ else
   golb_scenario "golb round_robin, $rate req/s" round_robin false none "${FAST[@]}" -- -rate "$rate"
   golb_scenario "golb p2c_ewma, $rate req/s" p2c_ewma false none "${FAST[@]}" -- -rate "$rate"
   proxy_scenario "ReverseProxy sized pool, $rate req/s" baseline \
-    "$BIN/golb-bench" baseline -addr "$PROXY" -backends "$fast_list" -idle-per-host "$CONNS"
+    "$BIN/golb-bench" baseline -addr "$PROXY" -backends "$fast_list" -idle-per-host "$CONNS" -- -rate "$rate"
 fi
 
+# The two policies are compared at the same offered load. Closed loop would
+# not do that: every connection that lands on the slow backend stalls, so
+# round robin would be offered a fraction of what p2c_ewma is. The rate is
+# half of what round robin itself sustains with the slow backend in the pool.
+mixed=("${FAST[0]}" "${FAST[1]}" "${FAST[2]}" "$SLOW")
 table_header "Tail latency with one slow backend (+$SLOW_DELAY on 1 of 4)"
-golb_scenario "golb round_robin, one slow backend" round_robin false none "${FAST[0]}" "${FAST[1]}" "${FAST[2]}" "$SLOW"
-golb_scenario "golb p2c_ewma, one slow backend" p2c_ewma false none "${FAST[0]}" "${FAST[1]}" "${FAST[2]}" "$SLOW"
+golb_scenario "golb round_robin, one slow backend, capacity" round_robin false none "${mixed[@]}" -- -save "$WORK/slow.json"
+slow_rate=$(half_of "$WORK/slow.json")
+if [ -z "$slow_rate" ]; then
+  not_measured "one slow backend at a fixed rate" "no round_robin capacity to derive the rate from"
+else
+  echo "<!-- rate: $slow_rate req/s for both policies -->"
+  golb_scenario "golb round_robin, one slow backend, $slow_rate req/s" round_robin false none "${mixed[@]}" -- -rate "$slow_rate"
+  golb_scenario "golb p2c_ewma, one slow backend, $slow_rate req/s" p2c_ewma false none "${mixed[@]}" -- -rate "$slow_rate"
+fi
 
 log "done"

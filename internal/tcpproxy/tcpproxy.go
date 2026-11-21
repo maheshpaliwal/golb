@@ -20,6 +20,9 @@ import (
 
 const (
 	copyBufferBytes = 32 << 10
+	// waitBufferBytes is what a connection holds while it waits for data;
+	// the pooled copy buffer is borrowed only while bytes are flowing.
+	waitBufferBytes = 1 << 10
 	dialKeepAlive   = 30 * time.Second
 	acceptBackoff   = 5 * time.Millisecond
 	acceptBackoffTo = time.Second
@@ -30,7 +33,13 @@ const (
 
 var errNoBackend = errors.New("no backend available")
 
-var copyBuffers = sync.Pool{New: func() any { return new([copyBufferBytes]byte) }}
+// bufferSource is the part of sync.Pool the copy loop uses.
+type bufferSource interface {
+	Get() any
+	Put(any)
+}
+
+var copyBuffers bufferSource = &sync.Pool{New: func() any { return new([copyBufferBytes]byte) }}
 
 // Target is the immutable forwarding state of one TCP listener.
 type Target struct {
@@ -281,10 +290,20 @@ func (r *relay) touch() time.Time {
 // copy moves bytes from src to dst until src ends. A clean end is passed on
 // as a half-close so the other direction can finish; an error or an idle
 // connection closes both sides, which stops the other direction too.
+//
+// It waits for data with a small buffer of its own. A read that fills the
+// buffer in use means more is queued, so the pooled copy buffer is taken;
+// a read that does not fill that one means the burst is over and it goes
+// back. An idle connection therefore pins about 2 KiB, not two copy buffers.
 func (r *relay) copy(dst, src net.Conn, bytes *metrics.Counter) {
-	array := copyBuffers.Get().(*[copyBufferBytes]byte)
-	defer copyBuffers.Put(array)
-	buf := array[:]
+	wait := new([waitBufferBytes]byte)
+	var pooled *[copyBufferBytes]byte
+	defer func() {
+		if pooled != nil {
+			copyBuffers.Put(pooled)
+		}
+	}()
+	buf := wait[:]
 	for {
 		// Deadline errors surface as a failed Read or Write below.
 		_ = src.SetReadDeadline(time.Now().Add(r.idle))
@@ -299,6 +318,15 @@ func (r *relay) copy(dst, src net.Conn, bytes *metrics.Counter) {
 				return
 			}
 			bytes.Add(uint64(n))
+		}
+		switch {
+		case pooled == nil && n == len(buf):
+			pooled = copyBuffers.Get().(*[copyBufferBytes]byte)
+			buf = pooled[:]
+		case pooled != nil && n < len(buf):
+			copyBuffers.Put(pooled)
+			pooled = nil
+			buf = wait[:]
 		}
 		if err == nil || r.stillActive(err) {
 			continue

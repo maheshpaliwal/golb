@@ -35,13 +35,14 @@ func (b *budget) recordRequest(sec uint64) {
 	}
 }
 
-// allowRetry reserves one retry at sec and reports whether the budget had room.
+// allowRetry reserves one retry at sec, the current unix second, and reports
+// whether the budget had room.
 func (b *budget) allowRetry(sec uint64) bool {
 	cell := &b.retries[sec%budgetWindowSeconds]
 	for {
 		old := cell.Load()
 		thisSecond := uint64(0)
-		if old>>countBits == sec {
+		if old>>countBits >= sec {
 			thisSecond = old & countMask
 		}
 		withinPercent := (windowSum(&b.retries, sec)+1)*percentScale <= windowSum(&b.requests, sec)*b.percent
@@ -54,8 +55,11 @@ func (b *budget) allowRetry(sec uint64) bool {
 	}
 }
 
+// bumped adds one to a cell. Only a cell stamped with an older second is
+// restarted: a caller whose clock reading is behind must never wipe counts
+// that belong to the present.
 func bumped(old, sec uint64) uint64 {
-	if old>>countBits == sec {
+	if old>>countBits >= sec {
 		return old + 1
 	}
 	return sec<<countBits | 1
@@ -65,8 +69,8 @@ func windowSum(cells *[budgetWindowSeconds]atomic.Uint64, sec uint64) uint64 {
 	var total uint64
 	for i := range cells {
 		v := cells[i].Load()
-		// Unsigned subtraction also discards cells stamped after sec.
-		if sec-v>>countBits < budgetWindowSeconds {
+		stamp := v >> countBits
+		if stamp >= sec || sec-stamp < budgetWindowSeconds {
 			total += v & countMask
 		}
 	}

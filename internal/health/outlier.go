@@ -15,7 +15,7 @@ type OutlierConfig struct {
 	Pool     string
 	Spec     core.Outlier // enabled, defaults applied, valid
 	Backends []*core.Backend
-	Observer core.Observer
+	Observer core.Observer // required
 	// Prev is the detector of the pool being replaced by a reload. Backends
 	// present in both keep their failure streak and ejection count.
 	Prev *Outlier
@@ -59,10 +59,7 @@ func NewOutlier(cfg OutlierConfig) *Outlier {
 		states:     make(map[*core.Backend]*outlierState, len(cfg.Backends)),
 		busy:       new(atomic.Bool),
 		observer:   cfg.Observer,
-		now:        func() int64 { return time.Now().UnixNano() },
-	}
-	if o.observer == nil {
-		o.observer = func(core.Event) {}
+		now:        core.Now,
 	}
 	if cfg.Prev != nil {
 		o.busy = cfg.Prev.busy
@@ -118,7 +115,7 @@ func (o *Outlier) fail(b *core.Backend, st *outlierState) {
 // failures rather than on every failure.
 func (o *Outlier) eject(b *core.Backend, st *outlierState, now int64) bool {
 	st.fails.Store(0)
-	if b.Ejected(now) || o.ejected(now) >= o.maxEjected {
+	if b.Ejected(now) || !o.mayEject(b, now) {
 		return false
 	}
 	count := st.ejections.Load() + 1
@@ -136,14 +133,21 @@ func (o *Outlier) eject(b *core.Backend, st *outlierState, now int64) bool {
 	return true
 }
 
-func (o *Outlier) ejected(now int64) int {
-	n := 0
-	for _, b := range o.backends {
-		if b.Ejected(now) {
-			n++
+// mayEject applies the limit to every backend that is out of rotation,
+// whether ejected here or marked unhealthy by the active check: what
+// max_ejected_percent protects is the capacity left to serve traffic. The
+// last available backend is never ejected, whatever the percentage.
+func (o *Outlier) mayEject(b *core.Backend, now int64) bool {
+	unavailable, othersAvailable := 0, 0
+	for _, other := range o.backends {
+		switch {
+		case !other.Available(now):
+			unavailable++
+		case other != b:
+			othersAvailable++
 		}
 	}
-	return n
+	return unavailable < o.maxEjected && othersAvailable > 0
 }
 
 // settle handles a success on a backend that has ejection history. It

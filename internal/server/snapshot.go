@@ -127,6 +127,43 @@ func (snap *snapshot) retire(next *snapshot) {
 	}
 }
 
+// forget removes the metric series of backends and pools that next no
+// longer has, so a scrape does not report them for ever.
+func (s *Server) forget(old, next *snapshot) {
+	for name, pool := range old.pools {
+		kept := make(map[string]bool)
+		if successor, ok := next.pools[name]; ok {
+			for _, b := range successor.Backends() {
+				kept[b.Addr] = true
+			}
+		}
+		for _, b := range pool.Backends() {
+			if kept[b.Addr] {
+				continue
+			}
+			s.registry.Delete(metricBackendInflight, "pool", name, "backend", b.Addr)
+			s.registry.Delete(metricBackendHealthy, "pool", name, "backend", b.Addr)
+			s.registry.Delete(metricBackendEjections, "pool", name, "backend", b.Addr)
+		}
+		old.upstreams[name].Forget(next.upstreams[name])
+	}
+}
+
+// watched lists the files whose content decides what is running: the
+// certificates and keys the configuration points at.
+func (snap *snapshot) watched() []string {
+	var paths []string
+	for _, listener := range snap.cfg.Listeners {
+		if listener.TLS == nil {
+			continue
+		}
+		for _, files := range listener.TLS.Certificates {
+			paths = append(paths, files.CertFile, files.KeyFile)
+		}
+	}
+	return paths
+}
+
 func (snap *snapshot) closePools() {
 	for _, pool := range snap.pools {
 		pool.Close()

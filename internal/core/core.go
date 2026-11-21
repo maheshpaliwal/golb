@@ -38,7 +38,9 @@ type Backend struct {
 	inflight     atomic.Int64
 	unhealthy    atomic.Bool  // active health-check verdict
 	ejectedUntil atomic.Int64 // unix nanoseconds; passive ejection
-	ewmaNanos    atomic.Int64 // smoothed latency
+	ewmaNanos    atomic.Int64 // smoothed latency; 0 means no sample yet
+	sampledAt    atomic.Int64 // Now() of the last latency sample
+	probedAt     atomic.Int64 // Now() of the last granted TryProbe
 }
 
 func NewBackend(addr string, weight uint32) *Backend {
@@ -67,15 +69,55 @@ func (b *Backend) SetHealthy(ok bool) (changed bool) { return b.unhealthy.Swap(!
 // Eject removes the backend from rotation until the given unix nanoseconds; 0 clears.
 func (b *Backend) Eject(until int64) { b.ejectedUntil.Store(until) }
 
-func (b *Backend) ObserveLatency(d time.Duration) {
+// latencyStaleAfter is how long a latency average stands without a new
+// sample before it stops being trusted.
+const latencyStaleAfter = time.Second
+
+func (b *Backend) ObserveLatency(d time.Duration) { b.ObserveLatencyAt(d, Now()) }
+
+// ObserveLatencyAt folds a sample taken at now (a Now value) into the
+// smoothed latency. A sample that follows a quiet period replaces the
+// average instead of nudging it: a backend that a latency-aware policy
+// stopped using after one bad response has no recent samples, so the next
+// one must be able to clear it.
+func (b *Backend) ObserveLatencyAt(d time.Duration, now int64) {
 	const smoothing = 8
+	sample := max(int64(d), 1)
+	last := b.sampledAt.Swap(now)
 	old := b.ewmaNanos.Load()
-	if old == 0 {
-		b.ewmaNanos.Store(int64(d))
+	if old == 0 || now-last >= int64(latencyStaleAfter) {
+		b.ewmaNanos.Store(sample)
 		return
 	}
-	b.ewmaNanos.Store(old + (int64(d)-old)/smoothing)
+	b.ewmaNanos.Store(max(old+(sample-old)/smoothing, 1))
 }
+
+// TryProbe reports whether the caller should send this backend a request
+// it would otherwise not get: the backend has a latency average that no
+// sample has confirmed for a while, and no other probe was granted in that
+// time. Without probes a latency-aware policy never revisits a backend it
+// has stopped using. At most one caller per quiet period gets true, so a
+// backend that really is slow receives about one request a second however
+// long its responses take.
+func (b *Backend) TryProbe(now int64) bool {
+	if b.ewmaNanos.Load() == 0 || now-b.sampledAt.Load() < int64(latencyStaleAfter) {
+		return false
+	}
+	last := b.probedAt.Load()
+	return now-last >= int64(latencyStaleAfter) && b.probedAt.CompareAndSwap(last, now)
+}
+
+var (
+	processStart     = time.Now()
+	processStartUnix = processStart.UnixNano()
+)
+
+// Now returns unix nanoseconds that never go backwards: the wall clock at
+// process start plus monotonic time since. Ejection deadlines and latency
+// timestamps use it, so a wall-clock step neither ends an ejection early nor
+// extends it. It stays within any such step of time.Now().UnixNano(), which
+// callers may still pass to Ejected and Available.
+func Now() int64 { return processStartUnix + int64(time.Since(processStart)) }
 
 // PickInfo carries per-request input to selection. It is passed by value and
 // must not cause an allocation.

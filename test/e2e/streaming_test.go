@@ -289,8 +289,6 @@ func TestResponseTrailersReachTheClient(t *testing.T) {
 
 // PRD 2.1 item 1 and the README list trailers as supported.
 func TestRequestTrailersReachTheBackend(t *testing.T) {
-	knownBug(t, "BUG: request trailers are dropped: the backend receives the trailer name announced in the Trailer header "+
-		"but an empty value after the body (response trailers work)")
 	var announced, value atomic.Value
 	sink := newBackend(t, "sink", func(w http.ResponseWriter, r *http.Request) {
 		_, err := io.Copy(io.Discard, r.Body)

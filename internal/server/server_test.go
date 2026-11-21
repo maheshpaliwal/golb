@@ -32,9 +32,7 @@ import (
 const waitLimit = 5 * time.Second
 
 // settings fills the config template; zero values give a plain HTTP
-// listener, a TCP listener and the admin listener, all on loopback port 0.
-// The three addresses are spelled differently because listener addresses
-// must be unique and "port 0" would otherwise collide.
+// listener, a TCP listener and the admin listener, all on 127.0.0.1 port 0.
 type settings struct {
 	backends []string
 	listener string // extra YAML under the HTTP listener, indented four spaces
@@ -44,12 +42,12 @@ type settings struct {
 
 func (s settings) yaml() string {
 	var doc strings.Builder
-	doc.WriteString("admin:\n  addr: localhost:0\n")
+	doc.WriteString("admin:\n  addr: 127.0.0.1:0\n")
 	doc.WriteString(s.top)
 	doc.WriteString("listeners:\n  - name: web\n    addr: 127.0.0.1:0\n    protocol: http\n")
 	doc.WriteString(s.listener)
 	doc.WriteString("    routes:\n      - pool: app\n")
-	doc.WriteString("  - name: raw\n    addr: \"[::1]:0\"\n    protocol: tcp\n    pool: app\n")
+	doc.WriteString("  - name: raw\n    addr: 127.0.0.1:0\n    protocol: tcp\n    pool: app\n")
 	doc.WriteString("pools:\n  - name: app\n    backends:\n")
 	for _, addr := range s.backends {
 		fmt.Fprintf(&doc, "      - addr: %s\n", addr)
@@ -402,6 +400,123 @@ func TestFileWatcherReloads(t *testing.T) {
 	}
 }
 
+// A file replaced between start-up's read and the watcher's first poll is
+// still loaded: the watcher compares with what was loaded, not with what it
+// first finds.
+func TestFileChangedBeforeWatcherStartsIsLoaded(t *testing.T) {
+	alpha, beta := named(t, "alpha"), named(t, "beta")
+	path := filepath.Join(t.TempDir(), "golb.yaml")
+	writeConfig(t, path, settings{backends: []string{alpha}})
+	srv, err := New(context.Background(), Options{
+		ConfigPath:    path,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AccessLog:     io.Discard,
+		WatchInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+	writeConfig(t, path, settings{backends: []string{beta}})
+	srv.Start()
+
+	in := &instance{Server: srv, path: path}
+	eventually(t, "the file written during start-up to be loaded", func() bool {
+		_, body := fetch(t, in.url("web"))
+		return body == "beta"
+	})
+}
+
+func TestReloadRemovesSeriesOfRemovedBackends(t *testing.T) {
+	alpha, beta := named(t, "alpha"), named(t, "beta")
+	in := start(t, settings{backends: []string{alpha, beta}}, -1)
+	for range 4 {
+		fetch(t, in.url("web"))
+	}
+	families := []string{"golb_upstream_requests_total", "golb_backend_inflight", "golb_backend_healthy", "golb_backend_ejections_total"}
+	series := func(addr string) []string {
+		_, exposition := fetch(t, in.url("admin")+"/metrics")
+		var found []string
+		for _, line := range strings.Split(exposition, "\n") {
+			for _, family := range families {
+				if strings.HasPrefix(line, family+"{") && strings.Contains(line, `backend="`+addr+`"`) {
+					found = append(found, line)
+				}
+			}
+		}
+		return found
+	}
+	if got := series(beta); len(got) != 5 {
+		t.Fatalf("before the reload %s has %d series, want 5: %q", beta, len(got), got)
+	}
+
+	writeConfig(t, in.path, settings{backends: []string{alpha}})
+	err := in.Reload(context.Background())
+	if err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := series(beta); len(got) != 0 {
+		t.Errorf("removed backend still exported: %q", got)
+	}
+	if got := series(alpha); len(got) != 5 {
+		t.Errorf("kept backend has %d series, want 5: %q", len(got), got)
+	}
+}
+
+func TestShutdownClosesUpgradedConnectionsAfterGrace(t *testing.T) {
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.WriteString(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		rw.Flush()
+		io.Copy(conn, rw)
+	}))
+	t.Cleanup(echo.Close)
+	in := start(t, settings{backends: []string{echo.Listener.Addr().String()}, top: "shutdown_grace: 300ms\n"}, -1)
+
+	conn, err := net.Dial("tcp", in.Addr("web").String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(waitLimit))
+	io.WriteString(conn, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	reader := bufio.NewReader(conn)
+	res, err := http.ReadResponse(reader, nil)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake: %v, %v", res, err)
+	}
+
+	began := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- in.Shutdown(context.Background()) }()
+	// During the grace period the connection still works.
+	io.WriteString(conn, "m")
+	_, err = io.ReadFull(reader, make([]byte, 1))
+	if err != nil {
+		t.Errorf("echo during the grace period: %v", err)
+	}
+	select {
+	case err = <-stopped:
+	case <-time.After(waitLimit):
+		t.Fatal("Shutdown did not return")
+	}
+	if err == nil {
+		t.Error("Shutdown reported a clean drain with a connection it had to close")
+	}
+	if waited := time.Since(began); waited < 250*time.Millisecond {
+		t.Errorf("Shutdown returned after %v, before the 300ms grace period", waited)
+	}
+	_, err = reader.ReadByte()
+	if err == nil {
+		t.Error("upgraded connection still open after Shutdown returned")
+	}
+	eventually(t, "the backend's in-flight count to return to 0", func() bool { return in.Backends()[0].Inflight == 0 })
+}
+
 func TestShutdownDrainsInFlightRequests(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -569,7 +684,7 @@ func TestTLSTermination(t *testing.T) {
 	base := settings{backends: []string{backend.Listener.Addr().String()}}
 	withTLS := base
 	withTLS.listener = tlsYAML(one, two)
-	in := start(t, withTLS, -1)
+	in := start(t, withTLS, 10*time.Millisecond)
 	addr := in.Addr("web").String()
 
 	// handshake returns the DNS name of the certificate the server presented.
@@ -624,6 +739,16 @@ func TestTLSTermination(t *testing.T) {
 		t.Errorf("backend saw X-Forwarded-Proto %q, want https", proto)
 	}
 
+	// A certificate replaced on disk is picked up without touching the config.
+	rotated := writeCertificate(t, dir, "one", "rotated.golb.test", roots)
+	if rotated != one {
+		t.Fatalf("rotation wrote %v, want to overwrite %v", rotated, one)
+	}
+	eventually(t, "the rotated certificate to be served", func() bool {
+		got, _, err := handshake("rotated.golb.test", 0)
+		return err == nil && got == "rotated.golb.test"
+	})
+
 	// Certificates are re-read on reload: swap the files' order and require 1.3.
 	reloaded := base
 	reloaded.listener = tlsYAML(two) + "      min_version: \"1.3\"\n"
@@ -658,7 +783,7 @@ func TestNewRejectsBadStart(t *testing.T) {
 		{name: "invalid config", yaml: "listeners: []\n", want: "no listeners"},
 		{
 			name: "address in use",
-			yaml: strings.Replace(settings{backends: []string{"127.0.0.1:1"}}.yaml(), "127.0.0.1:0", taken.Addr().String(), 1),
+			yaml: strings.Replace(settings{backends: []string{"127.0.0.1:1"}}.yaml(), "name: web\n    addr: 127.0.0.1:0", "name: web\n    addr: "+taken.Addr().String(), 1),
 			want: `listener "web": listen`,
 		},
 	}

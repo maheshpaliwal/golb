@@ -6,13 +6,17 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
+	"strings"
 
 	"github.com/maheshpaliwal/golb/internal/metrics"
 )
 
 const (
+	localhost          = "localhost"
 	metricsContentType = "text/plain; version=0.0.4; charset=utf-8"
 	jsonContentType    = "application/json"
 )
@@ -41,10 +45,23 @@ type Options struct {
 	Registry *metrics.Registry
 	Pprof    bool
 	Logger   *slog.Logger
+	// Addr is the configured admin address; its host is accepted in the
+	// Host header in addition to loopback names and IP literals.
+	Addr string
+	// AnyHost turns the Host check off. It is for an admin listener the
+	// operator deliberately exposed and reaches by names golb cannot know.
+	AnyHost bool
 }
 
+// NewHandler returns the admin endpoints behind a guard against browsers:
+// a page on another site must not be able to trigger a reload (cross-site
+// request) or read metrics and backend addresses (DNS rebinding).
 func NewHandler(opts Options) http.Handler {
-	h := &handler{source: opts.Source, registry: opts.Registry, logger: opts.Logger}
+	h := &handler{source: opts.Source, registry: opts.Registry, logger: opts.Logger, anyHost: opts.AnyHost}
+	configured, _, err := net.SplitHostPort(opts.Addr)
+	if err == nil {
+		h.host = strings.ToLower(configured)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", h.metrics)
 	mux.HandleFunc("GET /healthz", h.healthz)
@@ -58,13 +75,60 @@ func NewHandler(opts Options) http.Handler {
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	}
-	return mux
+	return h.guard(mux)
 }
 
 type handler struct {
 	source   Source
 	registry *metrics.Registry
 	logger   *slog.Logger
+	host     string
+	anyHost  bool
+}
+
+func (h *handler) guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.trustedHost(r.Host) {
+			h.text(w, http.StatusForbidden, "host not allowed\n")
+			return
+		}
+		if crossSite(r) {
+			h.text(w, http.StatusForbidden, "cross-site request refused\n")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// trustedHost accepts the names a rebinding attack cannot use: IP literals,
+// localhost and the configured admin host. A browser tricked into resolving
+// an attacker's name to this listener still sends the attacker's name.
+func (h *handler) trustedHost(hostport string) bool {
+	if h.anyHost {
+		return true
+	}
+	host := hostport
+	name, _, err := net.SplitHostPort(hostport)
+	if err == nil {
+		host = name
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	return host == localhost || host == h.host || net.ParseIP(host) != nil
+}
+
+// crossSite reports a request a browser sent on behalf of another origin.
+// Tools such as curl and Prometheus send neither header.
+func crossSite(r *http.Request) bool {
+	site := r.Header.Get("Sec-Fetch-Site")
+	if site != "" && site != "same-origin" && site != "none" {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	return err != nil || !strings.EqualFold(parsed.Host, r.Host)
 }
 
 func (h *handler) metrics(w http.ResponseWriter, r *http.Request) {

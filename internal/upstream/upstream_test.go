@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -53,6 +54,24 @@ func (l *eventLog) count(kind core.EventKind, addr string) int {
 		}
 	}
 	return n
+}
+
+// closedAddr returns a loopback address that refuses connections: a port
+// the kernel just handed out and that was closed again. Tests that really
+// dial use it instead of a fixed port number, which another program on the
+// machine may be listening on.
+func closedAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	closed := listener.Addr().String()
+	err = listener.Close()
+	if err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	return closed
 }
 
 func addr(i int) string { return fmt.Sprintf("127.0.0.1:%d", 9000+i) }
@@ -172,7 +191,9 @@ func TestDoneLatencySampling(t *testing.T) {
 		{name: "success is sampled", result: core.Result{Latency: 8 * time.Millisecond}, want: 8 * time.Millisecond},
 		{name: "zero is not sampled", result: core.Result{}, want: 0},
 		{name: "negative is not sampled", result: core.Result{Latency: -time.Second}, want: 0},
-		{name: "failure is not sampled", result: core.Result{Latency: time.Microsecond, Failed: true}, want: 0},
+		{name: "fast failure is sampled at the penalty", result: core.Result{Latency: time.Microsecond, Failed: true}, want: failurePenalty},
+		{name: "failure without a latency is sampled at the penalty", result: core.Result{Failed: true}, want: failurePenalty},
+		{name: "failure slower than the penalty keeps its latency", result: core.Result{Latency: 3 * time.Second, Failed: true}, want: 3 * time.Second},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -211,6 +232,78 @@ func TestDoneFailuresEjectAndEmit(t *testing.T) {
 			t.Fatal("ejected backend was picked")
 		}
 		p.Done(b, core.Result{Latency: time.Millisecond})
+	}
+}
+
+// With outlier detection off, nothing but latency keeps p2c_ewma away from a
+// backend that fails every request.
+func TestFailingBackendLosesTrafficWithoutOutlier(t *testing.T) {
+	s := spec(core.P2CEWMA, 4)
+	s.Outlier = core.Outlier{Disabled: true}
+	p := mustNew(t, s, nil, nil)
+	failing := p.Backends()[1]
+	hits := 0
+	const requests = 10_000
+	for range requests {
+		b := p.Pick(core.PickInfo{})
+		if b == failing {
+			hits++
+			p.Done(b, core.Result{Latency: 50 * time.Microsecond, Failed: true})
+			continue
+		}
+		p.Done(b, core.Result{Latency: time.Millisecond})
+	}
+	// Until its first failure is recorded the backend is unsampled and
+	// competes on load alone; after that it is only probed.
+	if hits > requests/100 {
+		t.Errorf("always-failing backend got %d of %d requests, want under 1%%", hits, requests)
+	}
+	if hits == 0 {
+		t.Error("always-failing backend was never tried")
+	}
+}
+
+// A reload that drops the health check must leave reused backends healthy
+// even though the old pool's checker is still running during the handover.
+func TestReloadDroppingHealthCheckLeavesBackendsHealthy(t *testing.T) {
+	dead := []core.BackendSpec{{Addr: closedAddr(t), Weight: 1}, {Addr: closedAddr(t), Weight: 1}}
+	for round := range 20 {
+		events := new(eventLog)
+		checked := spec(core.RoundRobin, 2)
+		checked.Backends = dead
+		// Every probe is refused, so the checker marks, and keeps marking,
+		// both backends down.
+		checked.Health = core.HealthCheck{Type: core.CheckTCP, Interval: 2 * time.Millisecond, Timeout: 2 * time.Millisecond, HealthyThreshold: 1, UnhealthyThreshold: 1}
+		old := mustNew(t, checked, nil, events.observe)
+		eventually(t, "old pool to mark its backends down", func() bool {
+			return !old.Backends()[0].Healthy() && !old.Backends()[1].Healthy()
+		})
+
+		next := spec(core.RoundRobin, 2)
+		next.Backends = dead
+		unchecked := mustNew(t, next, old, events.observe)
+		if unchecked.Backends()[0] != old.Backends()[0] {
+			t.Fatal("setup: backend was not reused")
+		}
+		// Odd rounds wait until the old checker has provably undone the
+		// new pool's reset (a second down event); even rounds close at
+		// once and leave the interleaving to chance.
+		if round%2 == 1 {
+			eventually(t, "the old checker to mark a reset backend down again", func() bool {
+				return events.count(core.BackendDown, dead[0].Addr) >= 2
+			})
+		}
+		old.Close()
+
+		for _, b := range unchecked.Backends() {
+			if !b.Healthy() {
+				t.Fatalf("round %d: backend %s is unhealthy in a pool without health checks after the old pool closed", round, b.Addr)
+			}
+		}
+		if b := unchecked.Pick(core.PickInfo{}); b == nil {
+			t.Fatalf("round %d: no backend available", round)
+		}
+		unchecked.Close()
 	}
 }
 
@@ -325,7 +418,7 @@ func TestNewReusesBackendState(t *testing.T) {
 
 func TestNewResetsStateTheNewSpecCannotUndo(t *testing.T) {
 	events := new(eventLog)
-	old := mustNew(t, spec(core.RoundRobin, 3), nil, events.observe)
+	old := mustNew(t, spec(core.RoundRobin, 4), nil, events.observe)
 	down, ejected := old.Backends()[0], old.Backends()[1]
 	down.SetHealthy(false)
 	for range 2 {
@@ -336,7 +429,7 @@ func TestNewResetsStateTheNewSpecCannotUndo(t *testing.T) {
 		t.Fatal("setup: backend not ejected")
 	}
 
-	next := spec(core.RoundRobin, 3)
+	next := spec(core.RoundRobin, 4)
 	next.Outlier = core.Outlier{Disabled: true}
 	reloaded := mustNew(t, next, old, events.observe)
 
@@ -355,8 +448,8 @@ func TestNewResetsStateTheNewSpecCannotUndo(t *testing.T) {
 		seen[b] = true
 		reloaded.Done(b, core.Result{})
 	}
-	if len(seen) != 3 {
-		t.Errorf("got traffic on %d backends after the reset, want 3", len(seen))
+	if len(seen) != 4 {
+		t.Errorf("got traffic on %d backends after the reset, want 4", len(seen))
 	}
 }
 
@@ -394,10 +487,11 @@ func TestHealthCheckLifecycle(t *testing.T) {
 
 	events := new(eventLog)
 	backend := server.Listener.Addr().String()
+	unreachable := closedAddr(t)
 	s := core.PoolSpec{
 		Name:     "app",
 		Policy:   core.RoundRobin,
-		Backends: []core.BackendSpec{{Addr: backend, Weight: 1}, {Addr: addr(0), Weight: 1}},
+		Backends: []core.BackendSpec{{Addr: backend, Weight: 1}, {Addr: unreachable, Weight: 1}},
 		Health: core.HealthCheck{
 			Type: core.CheckHTTP, Path: "/healthz", Interval: checkInterval, Timeout: checkInterval,
 			HealthyThreshold: 1, UnhealthyThreshold: 2,
@@ -410,8 +504,7 @@ func TestHealthCheckLifecycle(t *testing.T) {
 	}
 	live := byAddr(p)[backend]
 
-	// 127.0.0.1:9000 has no listener, so its probes are refused.
-	eventually(t, "unreachable backend to go down", func() bool { return !byAddr(p)[addr(0)].Healthy() })
+	eventually(t, "unreachable backend to go down", func() bool { return !byAddr(p)[unreachable].Healthy() })
 	for range 20 {
 		b := p.Pick(core.PickInfo{})
 		if b != live {

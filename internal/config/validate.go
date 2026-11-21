@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -53,7 +54,8 @@ func (c *Config) validate() error {
 		}
 		names[listener.Name] = true
 		other, taken := addrs[listener.Addr]
-		if taken {
+		// Port 0 asks the kernel for a free port, so two such addresses never collide.
+		if taken && !ephemeral(listener.Addr) {
 			errs = append(errs, fmt.Errorf("listener %q: address %s already used by %s", listener.Name, listener.Addr, other))
 		}
 		addrs[listener.Addr] = "listener " + strconv.Quote(listener.Name)
@@ -77,7 +79,8 @@ func (a Admin) validate() error {
 
 func (a AccessLog) validate() error {
 	var errs []error
-	if a.SampleRate < 0 || a.SampleRate > 1 {
+	// Written as a positive test so NaN fails it.
+	if !(a.SampleRate >= 0 && a.SampleRate <= 1) {
 		errs = append(errs, fmt.Errorf("access_log: sample_rate %v outside 0..1", a.SampleRate))
 	}
 	if a.BufferSize < 1 {
@@ -99,8 +102,8 @@ func (l *Listener) validate(pools map[string]bool) error {
 		fail("%v", err)
 	}
 	t := l.Timeouts
-	if t.ReadHeader <= 0 || t.Idle <= 0 || t.Request < 0 || t.MaxHeaderBytes <= 0 {
-		fail("timeouts need read_header > 0, idle > 0, request >= 0 and max_header_bytes > 0")
+	if t.ReadHeader <= 0 || t.Idle <= 0 || t.Request < 0 || t.BodyIdle < 0 || t.MaxHeaderBytes <= 0 {
+		fail("timeouts need read_header > 0, idle > 0, request >= 0, body_idle >= 0 and max_header_bytes > 0")
 	}
 
 	switch l.Protocol {
@@ -146,16 +149,17 @@ func (l *Listener) validateRoutes(pools map[string]bool) error {
 			fail("path_prefix must start with /")
 		}
 		if !validRouteHost(route.Host) {
-			fail("host must be a hostname or *.suffix, without a port")
+			fail("host must be a hostname or *.suffix, without a port or trailing dot")
 		}
-		key := route.Label()
+		// "/api" and "/api/" select the same requests, so they are one rule.
+		key := strings.ToLower(route.Host) + " " + strings.TrimRight(route.PathPrefix, "/")
 		if seen[key] {
 			fail("duplicate host and path_prefix")
 		}
 		seen[key] = true
 		limit := route.RateLimit
-		if limit != nil && (limit.RequestsPerSecond <= 0 || limit.Burst < 1) {
-			fail("rate_limit needs requests_per_second > 0 and burst >= 1")
+		if limit != nil && !validRate(limit.RequestsPerSecond, limit.Burst) {
+			fail("rate_limit needs a finite requests_per_second > 0 and burst >= 1")
 		}
 	}
 	return errors.Join(errs...)
@@ -172,7 +176,18 @@ func validRouteHost(host string) bool {
 		return true
 	}
 	name := strings.TrimPrefix(host, wildcardPrefix)
-	return name != "" && !strings.ContainsAny(name, "*:/ ")
+	// Request hosts are compared without their trailing dot, so a rule
+	// written with one could never match.
+	return name != "" && !strings.ContainsAny(name, "*:/ ") && !strings.HasSuffix(name, ".")
+}
+
+func validRate(perSecond float64, burst int) bool {
+	return perSecond > 0 && !math.IsInf(perSecond, 0) && burst >= 1
+}
+
+func ephemeral(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	return err == nil && port == "0"
 }
 
 func (t *TLS) validate(listener string) error {

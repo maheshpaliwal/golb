@@ -64,10 +64,11 @@ func (p *rotatingPool) Pick(info core.PickInfo) *core.Backend {
 }
 
 func (p *rotatingPool) Done(b *core.Backend, res core.Result) {
-	b.Release()
+	// Recorded before the release so a test that waits for idle sees the call.
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.results = append(p.results, doneCall{addr: b.Addr, result: res})
+	p.mu.Unlock()
+	b.Release()
 }
 
 func (p *rotatingPool) Backends() []*core.Backend { return p.backends }

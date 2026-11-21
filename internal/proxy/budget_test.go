@@ -119,3 +119,34 @@ func TestBudgetConcurrentNeverOverspends(t *testing.T) {
 		t.Errorf("allowed %d retries, want exactly %d", got, want)
 	}
 }
+
+// A caller whose clock reading is a whole window behind lands on the cell of
+// the current second. It must add to that cell, not restart it.
+func TestBudgetStaleSecondDoesNotResetTheWindow(t *testing.T) {
+	const (
+		now      = uint64(1_700_000_000)
+		requests = 100
+		percent  = 10
+	)
+	b := newBudget(percent)
+	for range requests {
+		b.recordRequest(now)
+	}
+	allowed := 0
+	for i := range 2000 {
+		sec := now
+		if i%2 == 1 {
+			sec = now - budgetWindowSeconds
+		}
+		if b.allowRetry(sec) {
+			allowed++
+		}
+	}
+	const want = requests * percent / percentScale
+	if allowed != want {
+		t.Errorf("%d retries allowed with stale callers mixed in, want %d", allowed, want)
+	}
+	if got := windowSum(&b.requests, now); got != requests {
+		t.Errorf("requests in the window = %d, want %d", got, requests)
+	}
+}

@@ -10,6 +10,11 @@ import (
 
 const (
 	virtualNodesPerUnit = 160
+	// maxRingPoints bounds memory and build time. A pool whose weights add
+	// up to more than maxRingPoints/160 gets fewer points per weight unit,
+	// the same for every backend, which coarsens the spread but keeps the
+	// ratio. Half a million points build in well under a second.
+	maxRingPoints = 1 << 19
 
 	// goldenGamma and the two multipliers are the SplitMix64 constants.
 	goldenGamma uint64 = 0x9e3779b97f4a7c15
@@ -25,8 +30,10 @@ const (
 )
 
 // ringHash is a consistent-hash ring. A backend's points depend only on its
-// address and weight unit count, so removing one backend moves only the keys
-// it owned.
+// own address and weight, so adding, removing or reweighting one backend
+// moves only keys to or from that backend. Weights are deliberately not
+// reduced by their GCD here: a new backend that changed the GCD would
+// redraw every other backend's points.
 type ringHash struct {
 	backends []*core.Backend
 	hashes   []uint64 // sorted
@@ -43,11 +50,15 @@ type ringPoint struct {
 }
 
 func newRingHash(backends []*core.Backend) *ringHash {
-	units, total := weightUnits(backends)
-	points := make([]ringPoint, 0, total*virtualNodesPerUnit)
+	var totalWeight int
+	for _, b := range backends {
+		totalWeight += int(b.Weight)
+	}
+	perUnit := pointsPerUnit(totalWeight)
+	points := make([]ringPoint, 0, totalWeight*perUnit)
 	for i, b := range backends {
 		seed := core.Hash(b.Addr)
-		for node := range uint64(units[i]) * virtualNodesPerUnit {
+		for node := range uint64(b.Weight) * uint64(perUnit) {
 			points = append(points, ringPoint{hash: mix(seed + (node+1)*goldenGamma), owner: uint32(i)})
 		}
 	}
@@ -69,6 +80,10 @@ func newRingHash(backends []*core.Backend) *ringHash {
 	}
 	r.indexPrefixes()
 	return r
+}
+
+func pointsPerUnit(totalWeight int) int {
+	return max(min(virtualNodesPerUnit, maxRingPoints/totalWeight), 1)
 }
 
 // indexPrefixes uses as many prefixes as there are points, rounded up to a
