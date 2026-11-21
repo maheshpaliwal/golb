@@ -262,3 +262,171 @@ each as a test of the configuration, check that the proxy reuses upstream
 connections and reports no errors, and record its version. Use a quiet
 machine, preferably with generator and backends on other hosts, and repeat
 the script several times before drawing any conclusion.
+
+## 6. After optimisation (2026-11-21)
+
+Measured on the working tree on top of `821bf20`, same machine and Go version
+as section 1. Every run is noisy: the 1-minute load average was between 17
+and 78 (quoted per block). "Before" is a binary built from `821bf20`, "after"
+the working tree; the two were run back to back in every round, each on a
+fresh process, after a direct-to-backend run. 64 connections, 1 KiB responses,
+`round_robin`, access log off, 2 s warm-up, unless stated. The harness was a
+throwaway script around `golb-bench echo` and `golb-bench load` with the
+configuration of `test/bench/e2e.sh`; it is not in the repository.
+
+CPU seconds per 100,000 requests is golb's CPU time from `ps` divided by
+`golb_requests_total`, warm-up included. It moved by 2-3 % between rounds
+while req/s moved by up to 60 %, so it is the figure to compare.
+
+### 6.1 What limits the comparison with "direct"
+
+- golb is not short of cores because of the generator or the backends. In the
+  golb rows golb used 2.1 to 3.5 cores, the echo backends 1.0 to 1.6 and the
+  generator 0.8 to 1.3, on 11 CPUs that other work kept busy. In the direct
+  rows the same backends and generator used about 2.7 and 2.2 cores, so
+  neither was at its limit when driving golb.
+- A direct request costs about 4.4 CPU-seconds per 100,000 (backend 2.4-2.5,
+  generator 1.9-2.0). Through golb the backend and generator cost about 5.0
+  (2.8 + 2.2) and golb 6.9 before, 5.9 after. On one shared machine the
+  "50 % of direct" target therefore needs golb to cost about 3.5 or less,
+  which is close to the kernel time of its four socket operations alone
+  (2.8-3.1, below). The ratio measures how three processes share one
+  machine as much as it measures the proxy.
+
+### 6.2 Where the time goes
+
+OS accounting (`ps` user and total CPU time, one 8 s run each, load average
+17-29):
+
+| | CPU-s per 100k | user | system |
+|---|---|---|---|
+| before | 6.93 | 3.92 (57 %) | 3.01 |
+| after | 5.87 | 3.12 (53 %) | 2.76 |
+
+CPU profile (`/debug/pprof/profile` on the admin listener, `admin.pprof:
+true`, 8 s under load; 3 profiles before, 5 after), cumulative share:
+
+| | before | after |
+|---|---|---|
+| `syscall.read` (sockets) | 43.0 % | 44.7 % |
+| `syscall.write` (sockets) | 41.8 % | 45.4 % |
+| `runtime.schedule` | 6.8 % | 5.6 % |
+| `runtime.kevent` | 3.1 % | 2.8 % |
+| `runtime.usleep` (idle spinning) | 2.1 % | 1.3 % |
+| GC mark workers and assists | 2.2 % | 0.6 % |
+| `runtime.mallocgc` | 1.4 % | 0.7 % |
+| `proxy.Handler.ServeHTTP`, including `ReverseProxy` and the retry transport, excluding I/O | 1.3 % | 1.1 % |
+
+**The profile is not trustworthy for ranking.** It puts 85 % of the samples
+in socket system calls, while the kernel's own accounting gives 43 % system
+time; on this platform the Go profiler over-counts system calls. The
+user-space costs were therefore ranked by experiment (CPU-s per 100k, the
+"before" binary with runtime settings changed through the environment,
+3 rounds of 6 s, load average 28-78):
+
+| setting | round 1 / 2 / 3 | versus default |
+|---|---|---|
+| default | 6.96 / 6.80 / 6.88, then 6.89 / 6.85 / 7.15 | |
+| `GOGC=200` | 5.93 / 6.11 / 6.35 | -12 % |
+| `GOGC=400` | 5.56 / 5.81 / 5.59 | -19 % |
+| `GOGC=800` | 5.54 / 5.64 / 5.76 | -18 % |
+| `GOGC=off GOMEMLIMIT=256MiB` | 5.27 / 5.48 / 5.40 | -22 % |
+| `GOMAXPROCS=4` | 5.64 / 6.08 / 5.74 | -17 % |
+| `GOMAXPROCS=4`, `GOGC=off GOMEMLIMIT=256MiB` | 5.54 / 5.60 / 5.61 | -19 % |
+
+So, of golb's CPU per request before the change: about 43 % kernel socket
+I/O, about 20 % garbage collection (`GODEBUG=gctrace=1` counted 1,233
+collections in a 10 s run, heap goal 8 MiB), and the rest `net/http` server,
+`http.Transport`, scheduler and allocation. `ReverseProxy`'s own work costs
+2.2 to 4.4 µs per request in a benchmark with a stub transport (26 allocs),
+about 4 % of the 69 µs; golb's own code and the balancer pick (about 50 ns)
+are below 1 %. Allocation: 7.3 kB and 81 objects per request before, 6.9 kB
+and 80 after (unchanged within sampling); the largest sites are
+`textproto.readMIMEHeader` (13 %), `Header.Clone` (12 %), `Request.Clone`
+(11.5 % cumulative).
+
+### 6.3 Change kept
+
+`cmd/golb/gc.go`: unless `GOGC` is set, golb lets the heap grow by about
+16 MiB between collections while less than 16 MiB is alive (GOGC between 100
+and 400, adjusted once a second from the live heap), and uses the stock 100
+above that. Collections in a 10 s run went from 1,233 to 209. Nothing in
+`internal/proxy` changed.
+
+5 rounds of 10 s; load average 24 at the start, 33 at the end.
+
+| 1 KiB, 64 connections | direct | before | after |
+|---|---|---|---|
+| ok req/s, median (min - max) | 105,804 (91,313 - 123,243) | 45,918 (30,720 - 50,442) | 50,729 (34,626 - 54,996) |
+| golb / direct (medians) | | 43 % | 48 % |
+| golb CPU-s per 100k, median (min - max) | | 6.96 (6.93 - 7.07) | 5.89 (5.79 - 5.99) |
+| closed-loop p50, median of rounds | 424 µs | 1.02 ms | 918 µs |
+| closed-loop p99, median of rounds | 3.59 ms | 6.62 ms | 6.52 ms |
+| golb peak RSS (MiB) | | 26 - 28 | 43 - 62, median 46 |
+
+The req/s ranges overlap, so by this document's rule the throughput gain is
+not established; round by round "after" was ahead in 4 of 5 (+52 %, +12 %,
+-17 %, +13 %, +1 %). The CPU ranges do not overlap: -15 %. An earlier
+3-round baseline of the same "before" binary (load average 25-56) gave
+39,380 (35,612 - 42,615) against direct 119,153, 33 %, and 6.74 CPU-s per
+100k.
+
+Other workloads, 3 rounds of 10 s each (load average 27-49):
+
+| workload | | before | after |
+|---|---|---|---|
+| 256 connections, 1 KiB | ok req/s | 44,736 (38,812 - 49,835) | 46,895 (35,677 - 53,469) |
+| | CPU-s per 100k | 6.51 (6.43 - 6.72) | 6.24 (6.09 - 6.50) |
+| | peak RSS (MiB) | 50 | 77 - 97 |
+| 64 connections, 10 KiB | ok req/s | 33,801 (29,935 - 35,261) | 35,918 (34,971 - 36,881) |
+| | CPU-s per 100k | 9.52 (9.42 - 9.55) | 8.37 (8.35 - 8.39) |
+| | peak RSS (MiB) | 28 - 32 | 43 - 45 |
+| fixed 20,000 req/s, 1 KiB | p50 (direct 68 / 91 / 103 µs) | 283 / 232 / 243 µs | 211 / 239 / 228 µs |
+| | added p50, per round | +215 / +141 / +139 µs | +143 / +147 / +125 µs |
+| | p99 (direct 41.4 / 3.0 / 46.7 ms) | 65.8 / 6.7 / 44.3 ms | 42.5 / 98.0 / 9.2 ms |
+| | CPU-s per 100k | 9.02 / 9.58 / 10.32 | 7.08 / 8.99 / 9.93 |
+
+At 256 connections more memory is alive, the stock setting already collects
+less often, and the gain is small (ranges overlap) for 27-47 MiB more
+memory; with `GOGC=400` one 3-round trial gave 5.60 / 5.91 / 5.65 against
+6.59 / 6.26 / 6.66 at about 105 MiB. Added p50 at a fixed rate is unchanged
+(median +141 µs before, +143 µs after) and p99 remains unmeasurable on this
+machine. Upstream connections stayed at 83-86 (64 connections) and 290-296
+(256 connections) through a run, so the default idle pool causes no dial
+churn.
+
+`go test -run '^$' -bench=Handler -benchmem -count=5 ./internal/proxy/`
+(code under test unchanged; load average 29 before the first run, 17 before
+the second):
+
+| | before, median (min - max) | after, median (min - max) | allocs/op |
+|---|---|---|---|
+| `BenchmarkHandler` ns/op | 19,792 (11,817 - 30,062) | 16,218 (12,478 - 16,679) | 83 / 83 |
+| `BenchmarkHandlerAccessLog` ns/op | 17,241 (13,810 - 22,009) | 16,316 (14,823 - 26,636) | 84 / 84 |
+
+### 6.4 Tried and not kept
+
+| candidate | measurement | outcome |
+|---|---|---|
+| Replace `ReverseProxy` with a direct `RoundTrip` and copy | stub-transport benchmark, 1 proc: `ReverseProxy` 2,179 - 4,383 ns, 26 allocs, 2,288 B; a bare replacement without 1xx, trailer or `Connection`-token handling 832 - 1,044 ns, 16 allocs, 1,600 B | at most about 1.4 µs of 59 µs per request (2 %), inside the noise, for re-implementing the upgrade, 1xx and trailer paths; not built |
+| Transport `ReadBufferSize`/`WriteBufferSize` 32 KiB and 64 KiB | 10 KiB: 8.38 / 8.57 / 8.54 CPU-s per 100k at the default 4 KiB, 9.05 / 9.10 / 9.34 at 32 KiB, 8.82 / 9.11 / 9.28 at 64 KiB; 1 KiB: 5.91 / 5.73 / 5.57 against 5.72 / 5.69 / 5.71 | worse or no change; reverted |
+| 32 MiB floor (GOGC up to 800) instead of 16 MiB | 5.57 / 5.72 / 5.47 / 5.48 against 5.72 / 6.12 / 5.82 / 5.77; peak RSS 62 - 108 MiB against 39 - 42 | about 3 % more for twice the memory and one overshoot; not kept |
+| `GOMAXPROCS` 4, 6, 8 with the change in | CPU-s per 100k medians 5.47, 5.60, 5.77 against 5.72; req/s medians 46,547, 52,326, 40,671 against 47,518 (5 rounds) | no consistent effect; no default, no recommendation |
+| `MaxIdleConnsPerHost`, `MaxConnsPerHost` | connection counts above | no churn to fix |
+| Per-goroutine start for `round_robin`/`least_conn`, fewer clock reads, timer reuse, in-place header mutation | about 50 ns of 59,000 ns for the pick; the rest are part of the 4 % above | not attempted |
+
+### 6.5 Targets after the change
+
+| Target | Measured | Verdict |
+|---|---|---|
+| Throughput at least 40,000 req/s | 50,729 (34,626 - 54,996) | met on the median, one round of five below |
+| Throughput at least 50 % of direct | 48 % (medians) | **missed**; see 6.1 |
+| Added p50 at 50 % load at most 150 µs | +143 µs (+125 to +147) | met, by a small margin |
+| Added p99 at most 1 ms | not separable from noise | no evidence that it is met |
+| Handler at most +5 allocs/op over bare `ReverseProxy` | 83, unchanged | met |
+
+What remains is the cost of `net/http` on both sides of the proxy plus the
+kernel: about 2.8 CPU-s per 100k in socket system calls and about 3.1 in
+user space, of which golb's own layer is a few percent. The Go profiler
+cannot rank that user-space remainder on this platform; profiling on Linux
+is the next step before any further change.

@@ -228,15 +228,33 @@ and bytes, reloads and dropped access-log records. All names start with
 ## Performance
 
 No performance claim is made here. Measured results, with the method, machine,
-Go version and commands needed to reproduce them, belong in
-`docs/BENCHMARKS.md`; until that file exists, golb's performance is unmeasured.
-The targets in the PRD are goals, not results.
+Go version and commands needed to reproduce them, are in
+`docs/BENCHMARKS.md`. The targets in the PRD are goals, not results.
 
 To run the micro-benchmarks yourself:
 
 ```sh
 make bench
 ```
+
+### Memory and the garbage collector
+
+A proxy keeps little memory alive and allocates a lot per second, so Go's
+stock collector setting (collect when the heap has doubled) ran about 120
+collections per second under load. Unless `GOGC` is set, golb therefore lets
+the heap grow by about 16 MiB between collections while less than that is
+alive, and uses the stock setting above it. Measured on the development
+machine at 64 connections (`docs/BENCHMARKS.md`, section 6): CPU time per
+request down about 15 %, resident memory up from about 27 MiB to about
+46 MiB. At 256 connections the saving was about 4 % for about 40 MiB more.
+
+- Set `GOGC` to control the collector yourself; golb then leaves it alone.
+  `GOGC=100` restores the stock behaviour. `GOGC=400` saved more CPU at 256
+  connections in one trial (about 12 %) for about 55 MiB more memory.
+- `GOMEMLIMIT` is honoured as usual and is the way to cap memory in a
+  container.
+- `GOMAXPROCS` made no consistent difference to throughput in the same
+  runs, so there is no recommendation for it.
 
 ## Development
 

@@ -61,6 +61,7 @@ func run(ctx context.Context, args []string, signals <-chan os.Signal, stdout, s
 		return exitFailure
 	}
 	srv.Start()
+	defer startGCTuning(logger)()
 	logger.Info("golb started", "config", *path)
 
 	for {
